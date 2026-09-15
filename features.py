@@ -16,7 +16,7 @@ TODO: Add strength of schedule adjustments
 
 import pandas as pd
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Optional
 import warnings
 
 
@@ -254,10 +254,17 @@ def engineer_features(data: pd.DataFrame,
             feature_df[f'visiting_rolling_{window}_win_pct']
         )
         feature_df[f'pythag_win_pct_diff_{window}'] = (
-            feature_df[f'home_rolling_{window}_pythag_win_pct'] - 
+            feature_df[f'home_rolling_{window}_pythag_win_pct'] -
             feature_df[f'visiting_rolling_{window}_pythag_win_pct']
         )
-    
+
+    # === Starting pitcher features ===
+    # Rolling "earned runs allowed in this pitcher's starts" - a proxy for
+    # starting pitcher quality/ERA. Only added if the underlying columns
+    # are present (older/custom data sources may not have them).
+    pitcher_stats = _build_pitcher_long_stats(df, window_sizes, use_ewma, ewma_span)
+    feature_df = _merge_pitcher_rolling_stats(feature_df, pitcher_stats, window_sizes)
+
     # === Calendar features (one-hot encoded) ===
     # Day of week
     feature_df['day_of_week_num'] = pd.to_datetime(feature_df['date_str']).dt.dayofweek
@@ -302,7 +309,17 @@ def engineer_features(data: pd.DataFrame,
     feature_df['days_rest_advantage'] = (
         feature_df['home_days_rest'] - feature_df['visiting_days_rest']
     )
-    
+
+    # Fill missing starting-pitcher rolling stats (e.g. a rookie's debut,
+    # or a pitcher's first tracked start) with the column median rather
+    # than 0 - unlike most other engineered features, 0 earned runs would
+    # misleadingly read as "great pitcher" instead of "unknown".
+    pitcher_cols = [c for c in feature_df.columns
+                    if c.startswith('home_starting_pitcher_rolling_')
+                    or c.startswith('visiting_starting_pitcher_rolling_')]
+    for col in pitcher_cols:
+        feature_df[col] = feature_df[col].fillna(feature_df[col].median())
+
     # Clean up any remaining NaN values
     feature_df = feature_df.fillna(0)
     
@@ -455,15 +472,126 @@ def _merge_rolling_stats(df: pd.DataFrame,
     return feature_df
 
 
+def _build_pitcher_long_stats(df: pd.DataFrame,
+                              window_sizes: List[int],
+                              use_ewma: bool,
+                              ewma_span: int) -> Optional[pd.DataFrame]:
+    """
+    Build a long-format (one row per pitcher start) history of team earned
+    runs allowed in that pitcher's starts, for a rolling "starting pitcher
+    quality" proxy - same merge_asof pattern as _build_team_long_stats.
+
+    CAVEAT: Retrosheet game logs report earned runs at the team level for
+    the whole game (all pitchers combined), not per individual pitcher,
+    and have no per-pitcher innings-pitched breakdown. So this tracks
+    earned runs allowed by the STARTER's team in games they started - not
+    the starter's own ERA (it's diluted by bullpen performance after the
+    starter leaves). Still informative: a team's earned runs in a game
+    strongly track its starter's outing, especially for starters who
+    regularly work deep into games.
+
+    Returns None (rather than raising) if the required columns aren't
+    present, so callers can skip this feature gracefully - e.g. for
+    older/alternate data sources that don't carry starting pitcher IDs.
+    """
+    required = ['home_starting_pitcher_id', 'visiting_starting_pitcher_id',
+                'home_team_earned_runs', 'visiting_team_earned_runs']
+    if not all(col in df.columns for col in required):
+        return None
+
+    home = pd.DataFrame({
+        'game_date': df['game_date'].values,
+        'pitcher_id': df['home_starting_pitcher_id'].values,
+        'earned_runs_allowed': df['home_team_earned_runs'].values,
+    })
+    visiting = pd.DataFrame({
+        'game_date': df['game_date'].values,
+        'pitcher_id': df['visiting_starting_pitcher_id'].values,
+        'earned_runs_allowed': df['visiting_team_earned_runs'].values,
+    })
+    long_df = pd.concat([home, visiting], ignore_index=True)
+    # Drop rows with no recorded starting pitcher (blank ID).
+    long_df = long_df[long_df['pitcher_id'].astype(str).str.len() > 0]
+    long_df = long_df.sort_values(['pitcher_id', 'game_date'], kind='mergesort').reset_index(drop=True)
+
+    grp = long_df.groupby('pitcher_id', sort=False)
+    for window in window_sizes:
+        if use_ewma:
+            span = min(window, ewma_span)
+            long_df[f'pitcher_rolling_{window}_earned_runs'] = grp['earned_runs_allowed'].transform(
+                lambda s: s.ewm(span=span, min_periods=1).mean())
+        else:
+            long_df[f'pitcher_rolling_{window}_earned_runs'] = grp['earned_runs_allowed'].transform(
+                lambda s: s.rolling(window=window, min_periods=1).mean())
+
+    return long_df
+
+
+def _merge_pitcher_rolling_stats(feature_df: pd.DataFrame,
+                                 pitcher_stats: Optional[pd.DataFrame],
+                                 window_sizes: List[int]) -> pd.DataFrame:
+    """
+    Attach each starting pitcher's rolling earned-runs-allowed (as of just
+    before this game) onto feature_df, keyed by pitcher ID via merge_asof
+    (same "strictly before this game" no-leakage semantics as the team
+    rolling stats).
+
+    Unlike team rolling stats, games are NOT dropped when a starting
+    pitcher has no prior tracked starts (e.g. a rookie's debut, or simply
+    the first start in the dataset) - that would silently drop a lot of
+    otherwise-valid games. Missing values are left as NaN here and filled
+    with the column median later in engineer_features(), alongside the
+    other engineered features.
+    """
+    if pitcher_stats is None or feature_df.empty:
+        return feature_df
+
+    stat_cols = [f'pitcher_rolling_{w}_earned_runs' for w in window_sizes]
+
+    working = feature_df.sort_values('game_date', kind='mergesort').reset_index(drop=True)
+    pitcher_sorted = pitcher_stats.sort_values('game_date', kind='mergesort').reset_index(drop=True)
+    lookup = pitcher_sorted[['game_date', 'pitcher_id'] + stat_cols]
+
+    home_matched = pd.merge_asof(
+        working[['game_date', 'home_starting_pitcher_id']],
+        lookup,
+        on='game_date', left_by='home_starting_pitcher_id', right_by='pitcher_id',
+        direction='backward', allow_exact_matches=False,
+    )
+    visiting_matched = pd.merge_asof(
+        working[['game_date', 'visiting_starting_pitcher_id']],
+        lookup,
+        on='game_date', left_by='visiting_starting_pitcher_id', right_by='pitcher_id',
+        direction='backward', allow_exact_matches=False,
+    )
+
+    for window in window_sizes:
+        col = f'pitcher_rolling_{window}_earned_runs'
+        working[f'home_starting_pitcher_rolling_{window}_er'] = home_matched[col].values
+        working[f'visiting_starting_pitcher_rolling_{window}_er'] = visiting_matched[col].values
+        # Positive = home starter has recently allowed FEWER earned runs
+        # than the visiting starter (i.e. home has the sharper starter),
+        # matching the "positive = home advantage" convention of the
+        # other *_diff features above.
+        working[f'starting_pitcher_er_advantage_{window}'] = (
+            working[f'visiting_starting_pitcher_rolling_{window}_er'] -
+            working[f'home_starting_pitcher_rolling_{window}_er']
+        )
+
+    return working
+
+
 def calculate_game_features(home_team: str,
                             visiting_team: str,
                             game_date: str,
                             game_data: pd.DataFrame,
                             odds: Dict = None,
-                            window_sizes: List[int] = [5, 10, 20]) -> Dict:
+                            window_sizes: List[int] = [5, 10, 20],
+                            home_starting_pitcher_id: Optional[str] = None,
+                            visiting_starting_pitcher_id: Optional[str] = None) -> Dict:
     """
     Calculate features for a single game prediction.
-    
+
     Parameters
     ----------
     home_team : str
@@ -478,7 +606,13 @@ def calculate_game_features(home_team: str,
         Dictionary with 'home_moneyline' and 'away_moneyline' keys
     window_sizes : list of int, optional
         Window sizes for rolling statistics
-    
+    home_starting_pitcher_id, visiting_starting_pitcher_id : str, optional
+        Retrosheet pitcher IDs (e.g. "grayj003") for each starter, used to
+        compute the same rolling earned-runs-allowed proxy as
+        engineer_features(). If omitted, or if game_data doesn't carry the
+        needed columns, those features default to a neutral ~league-average
+        value rather than being left out.
+
     Returns
     -------
     dict
@@ -586,7 +720,53 @@ def calculate_game_features(home_team: str,
         visiting_days_rest = 1
     
     features['days_rest_advantage'] = home_days_rest - visiting_days_rest
-    
+
+    # Starting pitcher features (optional - see calculate_game_features
+    # docstring). Mirrors the rolling earned-runs-allowed proxy computed
+    # in engineer_features()/_build_pitcher_long_stats, but looked up
+    # directly against game_data for a single pitcher rather than via the
+    # vectorized merge_asof pass used for a whole dataset.
+    pitcher_data_available = all(c in game_data.columns for c in [
+        'home_starting_pitcher_id', 'visiting_starting_pitcher_id',
+        'home_team_earned_runs', 'visiting_team_earned_runs'
+    ])
+
+    def _pitcher_recent_earned_runs(pitcher_id: Optional[str], n: int) -> Optional[float]:
+        if not pitcher_data_available or not pitcher_id:
+            return None
+        home_starts = game_data.loc[
+            game_data['home_starting_pitcher_id'] == pitcher_id, ['date', 'home_team_earned_runs']
+        ].rename(columns={'home_team_earned_runs': 'earned_runs'})
+        visiting_starts = game_data.loc[
+            game_data['visiting_starting_pitcher_id'] == pitcher_id, ['date', 'visiting_team_earned_runs']
+        ].rename(columns={'visiting_team_earned_runs': 'earned_runs'})
+        all_starts = pd.concat([home_starts, visiting_starts]).sort_values('date')
+        prior_starts = all_starts[all_starts['date'].astype(str) < str(game_date)]
+        if prior_starts.empty:
+            return None
+        return prior_starts['earned_runs'].tail(n).mean()
+
+    # ~4 earned runs/start is a reasonable league-average default when the
+    # pitcher is unknown or has no tracked prior starts - keeps the
+    # feature neutral rather than misleadingly reading as a great (0 ER)
+    # or terrible pitcher.
+    league_average_er = 4.0
+    for window in (5, 10):
+        if window not in window_sizes:
+            continue
+        home_er = _pitcher_recent_earned_runs(home_starting_pitcher_id, window)
+        visiting_er = _pitcher_recent_earned_runs(visiting_starting_pitcher_id, window)
+        features[f'home_starting_pitcher_rolling_{window}_er'] = (
+            home_er if home_er is not None else league_average_er
+        )
+        features[f'visiting_starting_pitcher_rolling_{window}_er'] = (
+            visiting_er if visiting_er is not None else league_average_er
+        )
+        features[f'starting_pitcher_er_advantage_{window}'] = (
+            features[f'visiting_starting_pitcher_rolling_{window}_er'] -
+            features[f'home_starting_pitcher_rolling_{window}_er']
+        )
+
     # Temporal features
     game_datetime = pd.to_datetime(game_date)
     day_of_week = game_datetime.dayofweek

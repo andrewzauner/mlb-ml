@@ -5,7 +5,7 @@ This module handles downloading Retrosheet game logs, loading historical game da
 generating/downloading odds data, and merging game and odds datasets.
 
 TODO: Replace placeholder odds generation with real historical odds API integration
-TODO: Add support for additional data sources (weather, injuries, starting pitchers)
+TODO: Add support for additional data sources (weather, injuries)
 """
 
 import pandas as pd
@@ -43,6 +43,22 @@ RETROSHEET_COLUMNS = {
     51: 'home_2B',  # Doubles
     52: 'home_3B',  # Triples
     53: 'home_HR',  # Home runs
+    # Team earned runs allowed (i.e. earned runs charged against that
+    # team's pitching staff - so "visiting_team_earned_runs" describes
+    # visiting PITCHING quality, not visiting offense). Verified across a
+    # full season: never exceeds the opposing team's score (earned <=
+    # total runs), with a small gap from occasional unearned runs - e.g.
+    # mean visiting_team_earned_runs is ~0.35 runs below home_score.
+    40: 'visiting_team_earned_runs',
+    68: 'home_team_earned_runs',
+    # Starting pitcher Retrosheet player IDs. Verified against a real game
+    # (Rockies @ Diamondbacks, 2018-03-29): column 101 held "grayj003"
+    # (Jon Gray, Colorado's actual starter that day) and column 103 held
+    # "corbp001" (Patrick Corbin, Arizona's), consistent with the
+    # winning/losing pitcher fields and both teams' batting lineups
+    # (pitchers batting 9th under NL rules at the time).
+    101: 'visiting_starting_pitcher_id',
+    103: 'home_starting_pitcher_id',
 }
 
 
@@ -148,19 +164,29 @@ def load_retrosheet_data(years: List[int], data_dir: str = './data') -> Optional
                 
                 # Ensure batting stat columns exist (defensive programming)
                 stat_columns = ['home_H', 'home_AB', 'visiting_H', 'visiting_AB',
-                               'home_2B', 'home_3B', 'home_HR', 
-                               'visiting_2B', 'visiting_3B', 'visiting_HR']
-                
+                               'home_2B', 'home_3B', 'home_HR',
+                               'visiting_2B', 'visiting_3B', 'visiting_HR',
+                               'home_team_earned_runs', 'visiting_team_earned_runs']
+
                 for col in stat_columns:
                     if col not in year_data.columns:
                         print(f"Warning: {col} not found for {year}, setting to 0")
                         year_data[col] = 0
-                
+
+                # Starting pitcher IDs are strings (Retrosheet player codes,
+                # e.g. "grayj003"), not numeric - just ensure the columns
+                # exist so downstream code can check for them uniformly.
+                for col in ['home_starting_pitcher_id', 'visiting_starting_pitcher_id']:
+                    if col not in year_data.columns:
+                        print(f"Warning: {col} not found for {year}, setting to empty")
+                        year_data[col] = ''
+
                 # Convert numeric columns to appropriate types
                 numeric_cols = ['visiting_score', 'home_score', 'home_H', 'home_AB',
-                               'visiting_H', 'visiting_AB', 'home_2B', 'home_3B', 
-                               'home_HR', 'visiting_2B', 'visiting_3B', 'visiting_HR']
-                
+                               'visiting_H', 'visiting_AB', 'home_2B', 'home_3B',
+                               'home_HR', 'visiting_2B', 'visiting_3B', 'visiting_HR',
+                               'home_team_earned_runs', 'visiting_team_earned_runs']
+
                 for col in numeric_cols:
                     if col in year_data.columns:
                         year_data[col] = pd.to_numeric(year_data[col], errors='coerce').fillna(0)

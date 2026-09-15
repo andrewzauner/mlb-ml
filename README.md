@@ -145,12 +145,20 @@ importance = predictor.feature_importance()
 - **BUG FIX**: Games are merged on a unique `game_id` instead of `(date, home_team,
   visiting_team)`, which isn't a unique key (doubleheaders share it) and used to fan out into
   duplicate/misaligned rows
+- **NEW**: Loads starting pitcher IDs and team earned-runs-allowed from the game logs
+  (`home_starting_pitcher_id`, `visiting_starting_pitcher_id`, `home_team_earned_runs`,
+  `visiting_team_earned_runs`). Column indices verified two ways: statistically (earned runs never
+  exceed the opposing team's score across a full season) and by cross-referencing real player/
+  manager identities in a sample row (visiting starter matched Colorado's actual starting pitcher
+  that day, consistent with the winning/losing pitcher fields and both teams' batting lineups).
 
 ### Feature Engineering (`features.py`)
 - Rolling team statistics (5, 10, 20 game windows)
 - Implied probabilities from betting odds
 - Temporal features (day of week, month, rest days)
 - Batting statistics and run differentials
+- **NEW**: Rolling starting-pitcher earned-runs-allowed, a proxy for pitcher quality/ERA (see
+  "Add pitcher statistics" below for the caveat on what this is and isn't)
 - **DEFENSIVE**: Checks for missing columns before use
 - **PERFORMANCE**: Rolling stats are computed with a vectorized `merge_asof`-based lookup instead
   of a per-game `iterrows()` scan of each team's full history - same "no data from the current or
@@ -219,8 +227,17 @@ The code includes extensive TODO comments marking oversimplifications. Key areas
    - Needed: Real sportsbook data via API or scraping
 
 2. **Add pitcher statistics**
-   - Current: Team-level stats only
-   - Needed: Starting pitcher ERA, WHIP, K/9, recent performance
+   - Current: a rolling starting-pitcher earned-runs-allowed feature (`starting_pitcher_er_advantage_{5,10}`,
+     see `features._build_pitcher_long_stats`) - identifies who's starting via Retrosheet's
+     `home`/`visiting_starting_pitcher_id` fields and tracks earned runs allowed in games they
+     started
+   - **Important caveat**: Retrosheet game logs report earned runs at the *team* level per game
+     (all pitchers combined), not per individual pitcher, and carry no per-pitcher innings-pitched
+     breakdown. So this is "earned runs allowed by the starter's team in games they started," not
+     the starter's own ERA - it's diluted by bullpen performance after the starter leaves. Still a
+     meaningfully informative proxy, but not the same thing as true per-pitcher ERA
+   - Still needed: WHIP, K/9, and genuine per-pitcher attribution - both require real per-pitcher
+     boxscore/play-by-play data (e.g. Retrosheet event files or a stats API), not just game logs
 
 3. **Implement park factors**
    - Current: All ballparks treated equally

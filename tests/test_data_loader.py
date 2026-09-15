@@ -6,7 +6,10 @@ import data_loader
 
 
 # A real row from a Retrosheet game log (2018-03-29 COL @ ARI), used to
-# pin down the column mapping against ground truth.
+# pin down the column mapping against ground truth. Truncated after the
+# game-winning RBI batter field (101 total fields) - long enough for the
+# batting-stat and earned-run columns, but short of the starting-pitcher
+# fields (101/103); see FULL_SAMPLE_ROW below for those.
 SAMPLE_ROW = (
     '"20180329","0","Thu","COL","NL",1,"ARI","NL",1,2,8,51,"N","","","","PHO01",'
     '48703,216,"100001000","30000320x",'
@@ -16,6 +19,29 @@ SAMPLE_ROW = (
     '"sches901","Stu Scheurwater","","(none)","","(none)",'
     '"blacb001","Buddy Black","lovut001","Tony Lovullo",'
     '"corbp001","Patrick Corbin","grayj003","Jon Gray","","(none)","lambj001","Jake Lamb"'
+)
+
+# The complete, unmodified line from data/gl2018.txt for the same game,
+# including the starting pitcher fields (101/103) and full batting
+# lineups. Used to verify the starting pitcher ID columns: visiting
+# starter is Colorado's Jon Gray ("grayj003"), home starter is Arizona's
+# Patrick Corbin ("corbp001") - cross-checked against the winning/losing
+# pitcher fields and both teams' batting lineups (pitchers batting 9th
+# under 2018 NL rules).
+FULL_SAMPLE_ROW = (
+    '"20180329","0","Thu","COL","NL",1,"ARI","NL",1,2,8,51,"N","","","","PHO01",48703,216,'
+    '"100001000","30000320x",33,9,0,0,2,2,1,0,0,2,0,12,0,0,2,0,7,5,8,8,0,0,24,8,0,0,0,0,'
+    '36,12,2,1,0,8,0,0,0,6,0,11,2,0,0,0,10,6,2,2,1,0,27,10,0,0,2,0,'
+    '"cedeg901","Gary Cederstrom","coope901","Eric Cooper","blasc901","Cory Blaser",'
+    '"sches901","Stu Scheurwater","","(none)","","(none)","blacb001","Buddy Black",'
+    '"lovut001","Tony Lovullo","corbp001","Patrick Corbin","grayj003","Jon Gray","","(none)",'
+    '"lambj001","Jake Lamb","grayj003","Jon Gray","corbp001","Patrick Corbin",'
+    '"blacc001","Charlie Blackmon",8,"lemad001","DJ LeMahieu",4,"arenn001","Nolan Arenado",5,'
+    '"stort001","Trevor Story",6,"gonzc001","Carlos Gonzalez",9,"desmi001","Ian Desmond",3,'
+    '"parrg001","Gerardo Parra",7,"iannc001","Chris Iannetta",2,"grayj003","Jon Gray",1,'
+    '"perad001","David Peralta",7,"polla001","A.J. Pollock",8,"goldp001","Paul Goldschmidt",3,'
+    '"lambj001","Jake Lamb",5,"martk001","Ketel Marte",4,"avila001","Alex Avila",2,'
+    '"ahmen001","Nick Ahmed",6,"dysoj001","Jarrod Dyson",9,"corbp001","Patrick Corbin",1,"","Y"'
 )
 
 
@@ -51,6 +77,28 @@ def test_retrosheet_columns_batting_stats_match_known_row(tmp_path):
     assert row['visiting_team'] == 'COL'
     assert row['home_score'] == 8
     assert row['visiting_score'] == 2
+    # Earned runs charged against each team's pitching staff. Verified
+    # across a full season: never exceeds the opposing team's score.
+    assert row['visiting_team_earned_runs'] == 8
+    assert row['home_team_earned_runs'] == 2
+
+
+def test_retrosheet_columns_starting_pitchers_match_known_row(tmp_path):
+    # Regression/verification test: starting pitcher ID columns (101,
+    # 103) were cross-validated against real player identities - the
+    # visiting starter should be Colorado's Jon Gray, the home starter
+    # Arizona's Patrick Corbin, consistent with the winning/losing pitcher
+    # fields and both teams' batting lineups in the same row.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    write_gamelog(data_dir / "GL2018.TXT", [FULL_SAMPLE_ROW])
+
+    df = data_loader.load_retrosheet_data([2018], str(data_dir))
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row['visiting_starting_pitcher_id'] == 'grayj003'
+    assert row['home_starting_pitcher_id'] == 'corbp001'
 
 
 def test_load_retrosheet_data_is_case_insensitive_to_filename(tmp_path):

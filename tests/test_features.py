@@ -86,3 +86,73 @@ def test_rolling_stats_no_leakage_simple_average():
 
     game3 = result[result['date_str'] == '20180403'].iloc[0]
     assert game3['home_rolling_5_runs_scored'] == pytest.approx((2 + 4) / 2)
+
+
+def _make_merged_games_with_pitchers(rows):
+    df = _make_merged_games(rows)
+    df['game_date'] = pd.to_datetime(df['date_str'], format='%Y%m%d')
+    return df.sort_values('game_date')
+
+
+def test_build_pitcher_long_stats_returns_none_without_required_columns():
+    merged = _make_merged_games_with_pitchers([
+        {'date': '20180401', 'home_team': 'A', 'visiting_team': 'B',
+         'home_score': 2, 'visiting_score': 1, 'day_night': 'N', 'season': 2018},
+    ])
+    # No starting-pitcher/earned-run columns present.
+    result = features._build_pitcher_long_stats(merged, [5], use_ewma=False, ewma_span=10)
+    assert result is None
+
+
+def test_pitcher_rolling_stats_no_leakage_simple_average():
+    # Pitcher "ace001" starts 3 games, allowing 1, 3, 5 earned runs (team
+    # totals) in order. The 3rd start's "prior" rolling average should be
+    # the mean of starts 1-2 only (2.0), never including the game itself
+    # or a later game the pitcher hasn't reached yet.
+    rows = [
+        {'date': '20180401', 'home_team': 'A', 'visiting_team': 'B',
+         'home_score': 5, 'visiting_score': 2, 'day_night': 'N', 'season': 2018,
+         'home_starting_pitcher_id': 'ace001', 'visiting_starting_pitcher_id': 'foe001',
+         'home_team_earned_runs': 1, 'visiting_team_earned_runs': 4},
+        {'date': '20180406', 'home_team': 'B', 'visiting_team': 'C',
+         'home_score': 3, 'visiting_score': 3, 'day_night': 'N', 'season': 2018,
+         'home_starting_pitcher_id': 'foe002', 'visiting_starting_pitcher_id': 'ace001',
+         'home_team_earned_runs': 2, 'visiting_team_earned_runs': 3},
+        {'date': '20180411', 'home_team': 'A', 'visiting_team': 'C',
+         'home_score': 4, 'visiting_score': 1, 'day_night': 'N', 'season': 2018,
+         'home_starting_pitcher_id': 'ace001', 'visiting_starting_pitcher_id': 'foe003',
+         'home_team_earned_runs': 5, 'visiting_team_earned_runs': 1},
+    ]
+    merged = _make_merged_games_with_pitchers(rows)
+
+    pitcher_stats = features._build_pitcher_long_stats(merged, [10], use_ewma=False, ewma_span=10)
+    assert pitcher_stats is not None
+
+    result = features._merge_pitcher_rolling_stats(merged, pitcher_stats, [10])
+    game3 = result[result['date_str'] == '20180411'].iloc[0]
+    assert game3['home_starting_pitcher_rolling_10_er'] == pytest.approx((1 + 3) / 2)
+
+
+def test_calculate_game_features_responds_to_starting_pitcher_id():
+    game_data = pd.DataFrame([
+        {'date': '20180401', 'home_team': 'ARI', 'visiting_team': 'COL',
+         'home_score': 8, 'visiting_score': 2,
+         'home_starting_pitcher_id': 'corbp001', 'visiting_starting_pitcher_id': 'grayj003',
+         'home_team_earned_runs': 2, 'visiting_team_earned_runs': 8},
+        {'date': '20180406', 'home_team': 'ARI', 'visiting_team': 'SFN',
+         'home_score': 3, 'visiting_score': 1,
+         'home_starting_pitcher_id': 'corbp001', 'visiting_starting_pitcher_id': 'bumgm001',
+         'home_team_earned_runs': 1, 'visiting_team_earned_runs': 3},
+    ])
+
+    with_ace = features.calculate_game_features(
+        'ARI', 'COL', '20180501', game_data, home_starting_pitcher_id='corbp001'
+    )
+    without_pitcher = features.calculate_game_features(
+        'ARI', 'COL', '20180501', game_data
+    )
+
+    # Corbin's tracked starts allowed 2 and 1 earned runs (mean 1.5),
+    # which should show up rather than the neutral default (4.0).
+    assert with_ace['home_starting_pitcher_rolling_5_er'] == pytest.approx(1.5)
+    assert without_pitcher['home_starting_pitcher_rolling_5_er'] == pytest.approx(4.0)

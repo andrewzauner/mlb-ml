@@ -321,10 +321,12 @@ class MLBPredictor:
     
     def predict_game(self, home_team: str, visiting_team: str,
                     game_date: Optional[str] = None,
-                    odds: Optional[Dict] = None) -> Dict:
+                    odds: Optional[Dict] = None,
+                    home_starting_pitcher_id: Optional[str] = None,
+                    visiting_starting_pitcher_id: Optional[str] = None) -> Dict:
         """
         Predict outcome of a specific game.
-        
+
         Parameters
         ----------
         home_team : str
@@ -335,15 +337,21 @@ class MLBPredictor:
             Game date in YYYYMMDD format
         odds : dict, optional
             Betting odds {'home_moneyline': -150, 'away_moneyline': +130}
-        
+        home_starting_pitcher_id, visiting_starting_pitcher_id : str, optional
+            Retrosheet pitcher IDs (e.g. "grayj003") for each starter, used
+            for the rolling earned-runs-allowed pitcher feature. Falls back
+            to a neutral default if omitted.
+
         Returns
         -------
         dict
             Prediction details
         """
         return predict_module.predict_game(
-            self.model, self.game_data, home_team, visiting_team, 
-            game_date, odds
+            self.model, self.game_data, home_team, visiting_team,
+            game_date, odds,
+            home_starting_pitcher_id=home_starting_pitcher_id,
+            visiting_starting_pitcher_id=visiting_starting_pitcher_id
         )
     
     def run_complete_pipeline(self, years: Optional[List[int]] = None,

@@ -21,10 +21,12 @@ def predict_game(model: Pipeline,
                 home_team: str,
                 visiting_team: str,
                 game_date: Optional[str] = None,
-                odds: Optional[Dict] = None) -> Dict:
+                odds: Optional[Dict] = None,
+                home_starting_pitcher_id: Optional[str] = None,
+                visiting_starting_pitcher_id: Optional[str] = None) -> Dict:
     """
     Predict the outcome of a specific game.
-    
+
     Parameters
     ----------
     model : sklearn.pipeline.Pipeline
@@ -40,6 +42,11 @@ def predict_game(model: Pipeline,
     odds : dict, optional
         Dictionary with 'home_moneyline' and 'away_moneyline' keys
         Example: {'home_moneyline': -150, 'away_moneyline': +130}
+    home_starting_pitcher_id, visiting_starting_pitcher_id : str, optional
+        Retrosheet pitcher IDs (e.g. "grayj003") for each starter. Used to
+        compute a rolling earned-runs-allowed proxy for pitcher quality;
+        omitting them falls back to a neutral league-average value for
+        that feature rather than failing.
     
     Returns
     -------
@@ -70,7 +77,6 @@ def predict_game(model: Pipeline,
     Notes
     -----
     TODO: Add prediction intervals (not just point estimates)
-    TODO: Implement ensemble predictions (multiple models)
     TODO: Add game simulation for score predictions
     TODO: Include uncertainty quantification
     """
@@ -90,7 +96,9 @@ def predict_game(model: Pipeline,
         visiting_team=visiting_team,
         game_date=game_date,
         game_data=game_data,
-        odds=odds
+        odds=odds,
+        home_starting_pitcher_id=home_starting_pitcher_id,
+        visiting_starting_pitcher_id=visiting_starting_pitcher_id
     )
     
     # Convert to DataFrame

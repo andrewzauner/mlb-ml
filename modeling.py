@@ -139,6 +139,14 @@ def _select_features(feature_df: pd.DataFrame, min_year: int) -> Tuple[pd.DataFr
     optional_features = [
         'home_rolling_10_home_win_pct',
         'visiting_rolling_10_away_win_pct',
+        # Starting pitcher rolling earned-runs-allowed proxy (only present
+        # if the game log data included starting pitcher IDs)
+        'home_starting_pitcher_rolling_10_er',
+        'visiting_starting_pitcher_rolling_10_er',
+        'starting_pitcher_er_advantage_10',
+        'home_starting_pitcher_rolling_5_er',
+        'visiting_starting_pitcher_rolling_5_er',
+        'starting_pitcher_er_advantage_5',
     ]
     
     for feat in optional_features:
