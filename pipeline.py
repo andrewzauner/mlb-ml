@@ -24,7 +24,10 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
                           data_dir: str = './data',
                           test_size: float = 0.2,
                           grid_search: bool = True,
-                          evaluate_betting: bool = True) -> Dict:
+                          evaluate_betting: bool = True,
+                          model_path: Optional[str] = None,
+                          model_type: str = 'gbm',
+                          compute_shap: bool = False) -> Dict:
     """
     Run the complete model pipeline from data download to evaluation.
     
@@ -52,7 +55,16 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         Whether to perform hyperparameter grid search (default: True)
     evaluate_betting : bool, optional
         Whether to evaluate betting performance (default: True)
-    
+    model_path : str, optional
+        If given, save the trained model pipeline to this path (via
+        joblib) after training completes.
+    model_type : str, optional
+        'gbm' (default), 'xgboost', or 'ensemble' - see modeling.train_model
+    compute_shap : bool, optional
+        Whether to also compute SHAP-based feature importance (default:
+        False - requires the optional `shap` package and adds runtime;
+        the built-in feature_importance() always runs regardless)
+
     Returns
     -------
     dict
@@ -61,6 +73,8 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         - 'game_data': Historical game data
         - 'metrics': Model evaluation metrics
         - 'feature_importance': Feature importance DataFrame
+        - 'shap_importance': SHAP-based feature importance DataFrame (None unless compute_shap=True)
+        - 'calibration': Calibration/reliability report (see modeling.calibration_report)
         - 'betting_results': Betting performance metrics (if evaluate_betting=True)
         
     Examples
@@ -75,7 +89,6 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     This means the model is trained on earlier games and tested on later games,
     simulating real-world usage.
     
-    TODO: Add model persistence (save/load trained models)
     TODO: Implement incremental updates (add new season data without retraining)
     TODO: Add data validation steps
     TODO: Implement automated hyperparameter tuning schedules
@@ -111,7 +124,7 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     # Step 3: Get odds data
     print("STEP 3/10: Generating odds data...")
     print("-" * 70)
-    odds_data = data_loader.download_odds_data(years)
+    odds_data = data_loader.download_odds_data(years, game_data=game_data)
     print()
     
     # Step 4: Merge datasets
@@ -141,7 +154,7 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     # Step 7: Train model
     print("STEP 7/10: Training model...")
     print("-" * 70)
-    model = modeling.train_model(X_train, y_train, grid_search=grid_search)
+    model = modeling.train_model(X_train, y_train, grid_search=grid_search, model_type=model_type)
     print()
     
     # Step 8: Evaluate model
@@ -155,21 +168,36 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     print("-" * 70)
     importance_df = modeling.feature_importance(model)
     print()
+
+    shap_importance_df = None
+    if compute_shap:
+        shap_importance_df = modeling.shap_feature_importance(model, X_test)
+        print()
+
+    calibration = modeling.calibration_report(model, X_test, y_test)
+    print()
     
     # Step 10: Betting performance (optional)
     betting_results = None
     if evaluate_betting:
         print("STEP 10/10: Evaluating betting performance...")
         print("-" * 70)
+        odds_cols = ['home_moneyline', 'away_moneyline']
+        test_odds = (feature_df.loc[X_test.index, odds_cols]
+                     if all(c in feature_df.columns for c in odds_cols) else None)
         betting_results = betting.evaluate_betting_performance(
-            model, X_test, y_test
+            model, X_test, y_test, odds_df=test_odds
         )
         print()
     else:
         print("STEP 10/10: Skipping betting evaluation (disabled)")
         print("-" * 70)
         print()
-    
+
+    if model_path:
+        save_model(model, model_path)
+        print()
+
     # Pipeline complete
     print("=" * 70)
     print("PIPELINE COMPLETE")
@@ -181,6 +209,8 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         'game_data': game_data,
         'metrics': metrics,
         'feature_importance': importance_df,
+        'shap_importance': shap_importance_df,
+        'calibration': calibration,
         'betting_results': betting_results,
         'test_data': (X_test, y_test)
     }
@@ -199,7 +229,6 @@ def save_model(model: Pipeline, filepath: str = './model.pkl') -> None:
         
     Notes
     -----
-    TODO: Implement this function using joblib or pickle
     TODO: Save model metadata (training date, features used, performance)
     TODO: Version control for models
     """
@@ -226,7 +255,6 @@ def load_model(filepath: str = './model.pkl') -> Pipeline:
         
     Notes
     -----
-    TODO: Implement this function using joblib or pickle
     TODO: Validate model compatibility with current code version
     TODO: Load and display model metadata
     """

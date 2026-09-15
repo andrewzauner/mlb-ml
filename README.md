@@ -15,7 +15,8 @@ mlb_predictor/
 ├── predict.py            # Single game prediction
 └── pipeline.py           # End-to-end workflow orchestration
 
-main.py                   # Entry point for running the pipeline
+main.py                   # Entry point for running the pipeline (CLI)
+tests/                    # pytest unit tests
 data/                     # Downloaded Retrosheet data (created automatically)
 ```
 
@@ -24,13 +25,19 @@ data/                     # Downloaded Retrosheet data (created automatically)
 ### Requirements
 
 ```bash
-pip install pandas numpy scikit-learn requests
+pip install -r requirements.txt
+```
+
+or directly:
+
+```bash
+pip install pandas numpy scikit-learn requests joblib pytest
 ```
 
 ### Optional (for enhancements)
 
 ```bash
-pip install xgboost lightgbm shap joblib
+pip install xgboost lightgbm shap optuna
 ```
 
 ## Quick Start
@@ -42,13 +49,33 @@ python main.py
 ```
 
 This will:
-1. Download historical game data from Retrosheet
+1. Download historical game data from Retrosheet (or reuse files already in `data/`)
 2. Generate placeholder odds data
 3. Engineer features
 4. Train a gradient boosting model
 5. Evaluate model performance
 6. Simulate betting strategies
 7. Demonstrate a single game prediction
+
+### CLI options
+
+```bash
+python main.py --years 2018 2022              # season range (default: 2018-2022)
+python main.py --no-grid-search                # skip hyperparameter search (much faster)
+python main.py --no-betting                     # skip the betting simulation
+python main.py --model-type xgboost             # use XGBoost instead of sklearn's GBM
+python main.py --model-type ensemble            # average GBM + XGBoost predictions
+python main.py --shap                           # also compute SHAP-based feature importance
+python main.py --save-model ./model.pkl         # save the trained model after training
+python main.py --load-model ./model.pkl         # reuse a saved model instead of retraining
+python main.py --data-dir ./data                # where Retrosheet files live/are cached
+```
+
+### Running tests
+
+```bash
+python -m pytest tests/ -v
+```
 
 ## Usage Examples
 
@@ -108,7 +135,16 @@ importance = predictor.feature_importance()
 - Downloads game logs from Retrosheet
 - Properly maps batting statistics columns (fixes KeyError bug)
 - Merges game data with odds data
-- **BUG FIX**: Now correctly extracts `home_H`, `home_AB`, etc. from Retrosheet files
+- **BUG FIX**: Now correctly extracts `home_H`, `home_AB`, etc. from Retrosheet files (the column
+  indices were verified against a real gamelog row - the previous mapping silently zeroed out
+  `home_AB` for every game and pulled the wrong stat entirely for the others)
+- **BUG FIX**: Loader now finds `gl{year}.txt` as well as `GL{year}.TXT` (case-insensitive lookup)
+- **BUG FIX**: Placeholder odds are now generated per real scheduled game (keyed off actual
+  `game_data`) instead of an independently-random schedule that almost never lined up with real
+  games - this raised the odds/game match rate from well under 1% to 100%
+- **BUG FIX**: Games are merged on a unique `game_id` instead of `(date, home_team,
+  visiting_team)`, which isn't a unique key (doubleheaders share it) and used to fan out into
+  duplicate/misaligned rows
 
 ### Feature Engineering (`features.py`)
 - Rolling team statistics (5, 10, 20 game windows)
@@ -116,19 +152,54 @@ importance = predictor.feature_importance()
 - Temporal features (day of week, month, rest days)
 - Batting statistics and run differentials
 - **DEFENSIVE**: Checks for missing columns before use
+- **PERFORMANCE**: Rolling stats are computed with a vectorized `merge_asof`-based lookup instead
+  of a per-game `iterrows()` scan of each team's full history - same "no data from the current or
+  a future game" guarantee, but roughly two orders of magnitude faster (a full 2018-2022 run went
+  from minutes to a few seconds)
 
 ### Modeling (`modeling.py`)
 - Gradient Boosting Classifier with grid search
 - Chronological train/test split (prevents data leakage)
+- Grid search now cross-validates with `TimeSeriesSplit` instead of plain K-fold, so
+  hyperparameter tuning never validates on games that happened before the training fold
+- Walk-forward (expanding-window) validation via `modeling.walk_forward_validation()` /
+  `MLBPredictor.walk_forward_validation()`, for a more robust multi-fold alternative to the single
+  80/20 split
+- Model persistence: `pipeline.save_model()` / `load_model()` are wired into the pipeline and
+  exposed via `main.py --save-model` / `--load-model`
+- Optional XGBoost backend alongside the default GradientBoostingClassifier - pass
+  `model_type='xgboost'` (or `main.py --model-type xgboost`); falls back to the sklearn model with
+  a warning if `xgboost` isn't installed
+- Simple ensemble (`model_type='ensemble'`) that trains both the GBM and XGBoost backends and
+  averages their predicted probabilities (`modeling.AveragingEnsembleClassifier`) - equal-weight
+  averaging, not stacking
+- Calibration/reliability diagnostics via `modeling.calibration_report()` - per-bin predicted vs.
+  actual win rate, plus Expected Calibration Error (ECE)
 - Multiple evaluation metrics (accuracy, AUC, Brier score, log loss)
-- Feature importance analysis
+- Feature importance analysis: the fast, built-in (impurity-based) importances via
+  `feature_importance()`, or `shap_feature_importance()` for SHAP values, which also show
+  *direction* of effect (e.g. "higher rest-day advantage pushes toward a home win") - both work
+  transparently with the ensemble, averaging across its members
+- **BUG FIX**: probability calibration and feature-importance extraction now work with current
+  scikit-learn (`CalibratedClassifierCV(cv='prefit')` was removed upstream; feature importance
+  was reading feature names off the wrong pipeline step)
+- **BUG FIX**: `use_class_weight=True` (the default) computed a class-weight dict, printed it, and
+  then never actually used it anywhere - `GradientBoostingClassifier` doesn't take `class_weight`,
+  and nothing turned it into `sample_weight` for `.fit()`. Sample weights are now computed and
+  passed through training (and the calibration re-fit) for real.
 
 ### Betting Simulation (`betting.py`)
-- Kelly Criterion bet sizing
+- Kelly Criterion bet sizing, now using each bet's actual American odds (converted to decimal) for
+  both stake sizing and payout, on whichever side (home or away) has the larger edge
 - Minimum edge thresholds
 - Bankroll management
 - Performance by confidence level
-- **NOTE**: Currently assumes fair odds without vig
+- A parallel flat-betting simulation (fixed stake per bet) run on the same bets, for comparison
+  against Kelly sizing
+- **BUG FIX**: bet sizing and payouts used to always assume fair, no-vig 2.0 decimal odds
+  regardless of the actual moneyline, and only ever considered betting the home side. Real
+  `home_moneyline`/`away_moneyline` are now threaded through from the pipeline (`odds_df` param);
+  omitting them still works, falling back to the old fair-odds assumption.
 
 ### Prediction (`predict.py`)
 - Single game outcome prediction
@@ -142,7 +213,9 @@ The code includes extensive TODO comments marking oversimplifications. Key areas
 
 ### High Priority
 1. **Replace placeholder odds** with real historical data
-   - Current: Random odds generation
+   - Current: Synthetic odds generated per real scheduled game (fixed a bug where they
+     were generated for an unrelated random schedule and barely overlapped with real games -
+     coverage is now 100%, but the *lines themselves* are still random, not real market data)
    - Needed: Real sportsbook data via API or scraping
 
 2. **Add pitcher statistics**
@@ -155,24 +228,27 @@ The code includes extensive TODO comments marking oversimplifications. Key areas
 
 ### Medium Priority
 4. **Better hyperparameter tuning**
-   - Consider Bayesian optimization (Optuna)
-   - Try XGBoost or LightGBM
+   - ~~Try XGBoost~~ - done, `model_type='xgboost'` (optional dependency)
+   - Still needed: LightGBM, Bayesian optimization (Optuna)
 
 5. **Improve bet sizing**
-   - Current: Simplified Kelly with fair odds
-   - Needed: Kelly with actual vig-adjusted odds
+   - ~~Kelly with actual (vig-included) American odds~~ - done, see `betting.evaluate_betting_performance(odds_df=...)`
+   - Still needed: the odds themselves are still synthetic (see #1) - the *math* is now
+     odds-realistic, but there's no real vig/market efficiency to bet against yet, so ROI numbers
+     from the current placeholder data are not meaningful
 
 6. **Add recency weighting**
-   - Current: Simple moving averages
-   - Needed: Exponentially weighted stats (recent games matter more)
+   - ~~Simple moving averages~~ - done, EWMA is the default (see `features.engineer_features(use_ewma=True)`)
 
 ### Lower Priority (But Still Important)
-7. Walk-forward validation
-8. Calibration curves
-9. SHAP values for feature importance
+7. ~~Walk-forward validation~~ - done, see `modeling.walk_forward_validation()`
+8. ~~Calibration curves~~ - done, see `modeling.calibration_report()` (ECE + per-bin reliability table)
+9. ~~SHAP values for feature importance~~ - done, see `modeling.shap_feature_importance()` (optional `shap` dependency)
 10. Injury/roster data
 11. Weather features
-12. Multiple model ensemble
+12. ~~Multiple model ensemble~~ - done (simple probability averaging), see `model_type='ensemble'` /
+    `modeling.AveragingEnsembleClassifier`. Still a TODO: weighted averaging or stacking with a
+    meta-learner instead of equal weights
 
 ## Extending the Model
 

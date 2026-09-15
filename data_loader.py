@@ -19,6 +19,11 @@ from typing import List, Optional
 
 # Retrosheet game log column mapping based on official documentation
 # Source: https://www.retrosheet.org/gamelogs/glfields.txt
+# Verified against raw gamelog rows: column 21 is visiting AB (a value in the
+# high 20s/30s), column 49 is home AB. The previous mapping here was off by
+# -4 on the visiting side and +1 on the home side, which silently zeroed out
+# home_AB for every game (AB fell on a column that's always blank) and
+# pulled the wrong stat entirely for the other fields.
 RETROSHEET_COLUMNS = {
     0: 'date',
     3: 'visiting_team',
@@ -26,18 +31,18 @@ RETROSHEET_COLUMNS = {
     9: 'visiting_score',
     10: 'home_score',
     12: 'day_night',
-    # Box score stats for home team
-    48: 'home_AB',  # At-bats
-    49: 'home_H',   # Hits
-    50: 'home_2B',  # Doubles
-    51: 'home_3B',  # Triples
-    52: 'home_HR',  # Home runs
     # Box score stats for visiting team
-    25: 'visiting_AB',  # At-bats
-    26: 'visiting_H',   # Hits
-    27: 'visiting_2B',  # Doubles
-    28: 'visiting_3B',  # Triples
-    29: 'visiting_HR',  # Home runs
+    21: 'visiting_AB',  # At-bats
+    22: 'visiting_H',   # Hits
+    23: 'visiting_2B',  # Doubles
+    24: 'visiting_3B',  # Triples
+    25: 'visiting_HR',  # Home runs
+    # Box score stats for home team
+    49: 'home_AB',  # At-bats
+    50: 'home_H',   # Hits
+    51: 'home_2B',  # Doubles
+    52: 'home_3B',  # Triples
+    53: 'home_HR',  # Home runs
 }
 
 
@@ -77,6 +82,23 @@ def download_retrosheet_data(years: List[int], data_dir: str = './data') -> None
             print(f"Error downloading data for {year}: {e}")
 
 
+def _find_game_log_file(year: int, data_dir: str) -> Optional[str]:
+    """
+    Locate the game log file for a given year, tolerating filename case.
+
+    Retrosheet zip archives extract to uppercase names (GL2018.TXT), but
+    files placed in the data directory by other means (e.g. manual
+    download, this repo's bundled sample data) commonly use lowercase
+    (gl2018.txt). Both are checked so loading doesn't silently fail.
+    """
+    candidates = [f"GL{year}.TXT", f"gl{year}.txt"]
+    for candidate in candidates:
+        candidate_path = os.path.join(data_dir, candidate)
+        if os.path.exists(candidate_path):
+            return candidate_path
+    return None
+
+
 def load_retrosheet_data(years: List[int], data_dir: str = './data') -> Optional[pd.DataFrame]:
     """
     Load and parse Retrosheet game logs.
@@ -104,10 +126,10 @@ def load_retrosheet_data(years: List[int], data_dir: str = './data') -> Optional
     TODO: Consider caching parsed data to avoid re-parsing on subsequent runs
     """
     all_data = []
-    
+
     for year in years:
-        file_path = os.path.join(data_dir, f"GL{year}.TXT")
-        if os.path.exists(file_path):
+        file_path = _find_game_log_file(year, data_dir)
+        if file_path is not None:
             try:
                 # Load data without predefined column names
                 year_data = pd.read_csv(file_path, header=None, sep=',', quotechar='"')
@@ -149,10 +171,17 @@ def load_retrosheet_data(years: List[int], data_dir: str = './data') -> Optional
             except Exception as e:
                 print(f"Error loading data for {year}: {e}")
         else:
-            print(f"File not found: {file_path}")
-    
+            print(f"File not found for {year}: no GL{year}.TXT or gl{year}.txt in {data_dir}")
+
     if all_data:
         game_data = pd.concat(all_data, ignore_index=True)
+        # Stable unique ID per game. (date, home_team, visiting_team) is NOT
+        # a unique key - doubleheaders put two games under the same triple,
+        # which previously caused merge_game_and_odds_data() to join each
+        # such game against every odds row sharing that key (a many-to-many
+        # fan-out that duplicated rows and could pair a game with the wrong
+        # game's odds).
+        game_data['game_id'] = range(len(game_data))
         print(f"Total games loaded: {len(game_data)}")
         return game_data
     else:
@@ -160,95 +189,129 @@ def load_retrosheet_data(years: List[int], data_dir: str = './data') -> Optional
         return None
 
 
-def download_odds_data(years: List[int]) -> pd.DataFrame:
+def download_odds_data(years: List[int],
+                       game_data: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
     Generate placeholder odds data (to be replaced with real API integration).
-    
+
     Parameters
     ----------
     years : list of int
         Years to generate odds data for
-    
+    game_data : pd.DataFrame, optional
+        Actual loaded game data (from load_retrosheet_data). When provided,
+        one synthetic odds line is generated per real game, so the odds
+        "market" lines up with the real schedule instead of a randomly
+        generated set of matchups that almost never land on a real game
+        date. When omitted, falls back to generating a synthetic schedule
+        from scratch (kept for standalone/backwards-compatible use).
+
     Returns
     -------
     pd.DataFrame
-        DataFrame with columns: date, home_team, visiting_team, 
+        DataFrame with columns: date, home_team, visiting_team,
         home_moneyline, away_moneyline
-        
+
     Notes
     -----
     This is a PLACEHOLDER function that generates synthetic odds data.
-    
+
     TODO: Replace with actual historical odds data from one of these sources:
         - The Odds API (https://the-odds-api.com/) - provides historical odds
         - SportsOddsHistory.com - historical odds database
         - OddsPortal scraping (check terms of service)
         - Purchase historical data from a sports data provider
-    
+
     OVERSIMPLIFICATION WARNING:
         The current random odds generation:
         - Does not reflect actual market conditions
         - Ignores home field advantage patterns
         - Doesn't account for pitcher matchups
         - Has no correlation with actual team strength
-        
+
     For production use, this MUST be replaced with real historical odds.
+
+    BUG FIX (previous version): When game_data wasn't wired in, odds were
+    generated for a completely independent, randomly sampled schedule
+    (random dates, random team pairings). Because that schedule almost
+    never coincided with the real one, merge_game_and_odds_data() kept
+    well under 1% of games - starving the model of training data. Keying
+    odds generation off the real schedule keeps the "placeholder" caveat
+    but restores full coverage.
     """
     print("Note: Generating placeholder odds data.")
     print("TODO: Replace with actual historical odds API integration")
-    
-    dates = []
-    home_teams = []
-    away_teams = []
-    home_moneyline = []
-    away_moneyline = []
-    
-    # MLB team abbreviations (Retrosheet format)
-    teams = ['NYA', 'BOS', 'TOR', 'BAL', 'TBA',
-             'CHA', 'CLE', 'DET', 'KCA', 'MIN',
-             'HOU', 'LAA', 'OAK', 'SEA', 'TEX',
-             'ATL', 'MIA', 'NYN', 'PHI', 'WAS',
-             'CHN', 'CIN', 'MIL', 'PIT', 'SLN',
-             'ARI', 'COL', 'LAN', 'SDN', 'SFN']
-    
-    for year in years:
-        for month in range(4, 11):  # Baseball season (April-October)
-            for day in range(1, 28):
-                if np.random.random() < 0.3:  # Not every day has games
-                    continue
-                
-                # Generate 8 random games for this date
-                for _ in range(8):
-                    date_str = f"{year}{month:02d}{day:02d}"
-                    game_teams = np.random.choice(teams, 2, replace=False)
-                    home_team = game_teams[0]
-                    away_team = game_teams[1]
-                    
-                    # Generate random odds
-                    # TODO: Model this based on actual betting market patterns
-                    is_home_favorite = np.random.random() > 0.4
-                    
-                    if is_home_favorite:
-                        home_line = -np.random.randint(110, 220)
-                        away_line = np.random.randint(100, 200)
-                    else:
-                        home_line = np.random.randint(100, 200)
-                        away_line = -np.random.randint(110, 220)
-                    
-                    dates.append(date_str)
-                    home_teams.append(home_team)
-                    away_teams.append(away_team)
-                    home_moneyline.append(home_line)
-                    away_moneyline.append(away_line)
-    
-    odds_data = pd.DataFrame({
-        'date': dates,
-        'home_team': home_teams,
-        'visiting_team': away_teams,
-        'home_moneyline': home_moneyline,
-        'away_moneyline': away_moneyline
-    })
-    
+
+    def _synthetic_moneylines(n: int):
+        is_home_favorite = np.random.random(n) > 0.4
+        home_line = np.where(
+            is_home_favorite,
+            -np.random.randint(110, 220, size=n),
+            np.random.randint(100, 200, size=n)
+        )
+        away_line = np.where(
+            is_home_favorite,
+            np.random.randint(100, 200, size=n),
+            -np.random.randint(110, 220, size=n)
+        )
+        return home_line, away_line
+
+    if game_data is not None and len(game_data) > 0:
+        # Generate one odds line per actual game, so odds coverage matches
+        # the real schedule instead of a disjoint random one.
+        relevant = game_data[game_data['season'].isin(years)] if 'season' in game_data.columns else game_data
+        home_line, away_line = _synthetic_moneylines(len(relevant))
+
+        odds_data = pd.DataFrame({
+            'date': relevant['date'].astype(str).values,
+            'home_team': relevant['home_team'].values,
+            'visiting_team': relevant['visiting_team'].values,
+            'home_moneyline': home_line,
+            'away_moneyline': away_line
+        })
+        # Carry the unique game_id through when available so
+        # merge_game_and_odds_data can do an exact 1:1 join instead of
+        # matching on (date, home_team, visiting_team), which collides on
+        # doubleheaders.
+        if 'game_id' in relevant.columns:
+            odds_data['game_id'] = relevant['game_id'].values
+    else:
+        # Fallback: no real schedule available, synthesize one from scratch.
+        dates = []
+        home_teams = []
+        away_teams = []
+
+        # MLB team abbreviations (Retrosheet format)
+        teams = ['NYA', 'BOS', 'TOR', 'BAL', 'TBA',
+                 'CHA', 'CLE', 'DET', 'KCA', 'MIN',
+                 'HOU', 'LAA', 'OAK', 'SEA', 'TEX',
+                 'ATL', 'MIA', 'NYN', 'PHI', 'WAS',
+                 'CHN', 'CIN', 'MIL', 'PIT', 'SLN',
+                 'ARI', 'COL', 'LAN', 'SDN', 'SFN']
+
+        for year in years:
+            for month in range(4, 11):  # Baseball season (April-October)
+                for day in range(1, 28):
+                    if np.random.random() < 0.3:  # Not every day has games
+                        continue
+
+                    # Generate 8 random games for this date
+                    for _ in range(8):
+                        date_str = f"{year}{month:02d}{day:02d}"
+                        game_teams = np.random.choice(teams, 2, replace=False)
+                        dates.append(date_str)
+                        home_teams.append(game_teams[0])
+                        away_teams.append(game_teams[1])
+
+        home_line, away_line = _synthetic_moneylines(len(dates))
+        odds_data = pd.DataFrame({
+            'date': dates,
+            'home_team': home_teams,
+            'visiting_team': away_teams,
+            'home_moneyline': home_line,
+            'away_moneyline': away_line
+        })
+
     print(f"Created placeholder odds data with {len(odds_data)} entries")
     return odds_data
 
@@ -278,24 +341,37 @@ def merge_game_and_odds_data(game_data: pd.DataFrame,
     
     TODO: Add logic to handle multiple odds from different sportsbooks
     TODO: Consider keeping games without odds for evaluation purposes
+
+    BUG FIX: (date, home_team, visiting_team) is not a unique key -
+    doubleheaders put two distinct games under the same triple. Merging on
+    it alone silently fans out: each such game matches every odds row
+    sharing that key, duplicating rows and, with a real odds feed (multiple
+    books/lines per game), pairing games with the wrong game's odds. When
+    both frames carry a game_id (set by load_retrosheet_data /
+    download_odds_data), merge on that instead for an exact 1:1 join.
     """
     if game_data is None or odds_data is None:
         print("Cannot merge: game_data or odds_data is None")
         return None
-    
+
     # Convert date formats to match
     game_data['date_str'] = game_data['date'].astype(str)
-    
-    # Merge on date and team names
-    merged_data = pd.merge(
-        game_data,
-        odds_data,
-        left_on=['date_str', 'home_team', 'visiting_team'],
-        right_on=['date', 'home_team', 'visiting_team'],
-        how='inner'
-    )
-    
+
+    if 'game_id' in game_data.columns and 'game_id' in odds_data.columns:
+        merged_data = pd.merge(game_data, odds_data, on='game_id', how='inner',
+                               suffixes=('', '_odds'))
+    else:
+        # Fallback for odds data without a game_id (e.g. a real odds feed
+        # keyed only by date/teams). Can still fan out on doubleheaders.
+        merged_data = pd.merge(
+            game_data,
+            odds_data,
+            left_on=['date_str', 'home_team', 'visiting_team'],
+            right_on=['date', 'home_team', 'visiting_team'],
+            how='inner'
+        )
+
     print(f"Merged data has {len(merged_data)} rows")
     print(f"Match rate: {len(merged_data) / len(game_data) * 100:.1f}% of games have odds")
-    
+
     return merged_data
