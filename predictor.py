@@ -115,8 +115,11 @@ class MLBPredictor:
         Notes
         -----
         This is currently a placeholder. Replace with actual odds API.
+        If game data has already been loaded (via load_retrosheet_data),
+        odds are generated for the real schedule so they actually line up
+        with game_data during the merge step.
         """
-        self.odds_data = data_loader.download_odds_data(years)
+        self.odds_data = data_loader.download_odds_data(years, game_data=self.game_data)
         return self.odds_data
     
     def merge_game_and_odds_data(self) -> pd.DataFrame:
@@ -219,7 +222,32 @@ class MLBPredictor:
         """
         return modeling.feature_importance(self.model)
     
-    def evaluate_betting_performance(self, X_test: pd.DataFrame, 
+    def walk_forward_validation(self, feature_df: pd.DataFrame,
+                               n_splits: int = 5,
+                               grid_search: bool = False) -> Dict:
+        """
+        Evaluate the model with expanding-window walk-forward validation
+        instead of a single train/test split.
+
+        Parameters
+        ----------
+        feature_df : pd.DataFrame
+            Feature DataFrame (output of engineer_features)
+        n_splits : int, optional
+            Number of expanding-window folds
+        grid_search : bool, optional
+            Whether to grid search hyperparameters within each fold
+
+        Returns
+        -------
+        dict
+            Per-fold metrics plus mean/std across folds
+        """
+        return modeling.walk_forward_validation(
+            feature_df, n_splits=n_splits, grid_search=grid_search
+        )
+
+    def evaluate_betting_performance(self, X_test: pd.DataFrame,
                                     y_test: pd.Series,
                                     kelly_fraction: float = 0.25) -> Dict:
         """

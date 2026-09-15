@@ -24,7 +24,8 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
                           data_dir: str = './data',
                           test_size: float = 0.2,
                           grid_search: bool = True,
-                          evaluate_betting: bool = True) -> Dict:
+                          evaluate_betting: bool = True,
+                          model_path: Optional[str] = None) -> Dict:
     """
     Run the complete model pipeline from data download to evaluation.
     
@@ -52,7 +53,10 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         Whether to perform hyperparameter grid search (default: True)
     evaluate_betting : bool, optional
         Whether to evaluate betting performance (default: True)
-    
+    model_path : str, optional
+        If given, save the trained model pipeline to this path (via
+        joblib) after training completes.
+
     Returns
     -------
     dict
@@ -75,7 +79,6 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     This means the model is trained on earlier games and tested on later games,
     simulating real-world usage.
     
-    TODO: Add model persistence (save/load trained models)
     TODO: Implement incremental updates (add new season data without retraining)
     TODO: Add data validation steps
     TODO: Implement automated hyperparameter tuning schedules
@@ -111,7 +114,7 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     # Step 3: Get odds data
     print("STEP 3/10: Generating odds data...")
     print("-" * 70)
-    odds_data = data_loader.download_odds_data(years)
+    odds_data = data_loader.download_odds_data(years, game_data=game_data)
     print()
     
     # Step 4: Merge datasets
@@ -169,7 +172,11 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         print("STEP 10/10: Skipping betting evaluation (disabled)")
         print("-" * 70)
         print()
-    
+
+    if model_path:
+        save_model(model, model_path)
+        print()
+
     # Pipeline complete
     print("=" * 70)
     print("PIPELINE COMPLETE")
@@ -199,7 +206,6 @@ def save_model(model: Pipeline, filepath: str = './model.pkl') -> None:
         
     Notes
     -----
-    TODO: Implement this function using joblib or pickle
     TODO: Save model metadata (training date, features used, performance)
     TODO: Version control for models
     """
@@ -226,7 +232,6 @@ def load_model(filepath: str = './model.pkl') -> Pipeline:
         
     Notes
     -----
-    TODO: Implement this function using joblib or pickle
     TODO: Validate model compatibility with current code version
     TODO: Load and display model metadata
     """

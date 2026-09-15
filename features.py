@@ -194,73 +194,22 @@ def engineer_features(data: pd.DataFrame,
     # === Rolling team performance statistics ===
     # Sort by date for time-series features
     df = df.sort_values(by=['game_date'])
-    
-    # Build team-level datasets for rolling calculations
-    team_groups = _build_team_histories(df)
-    
-    # Calculate rolling stats for each team
+
+    # Build a long-format (one row per team-game) history with rolling
+    # performance stats, then attach each team's "as of just before this
+    # game" stats back onto the game-level DataFrame.
     # IMPROVEMENT: Using EWMA for recency weighting when enabled
-    for team, team_df in team_groups.items():
-        for window in window_sizes:
-            if use_ewma:
-                # Exponentially weighted moving average - recent games matter more
-                # span parameter controls the decay rate (higher = slower decay)
-                team_df[f'rolling_{window}_runs_scored'] = (
-                    team_df['team_score']
-                    .ewm(span=min(window, ewma_span), min_periods=1)
-                    .mean()
-                )
-                team_df[f'rolling_{window}_runs_allowed'] = (
-                    team_df['opponent_score']
-                    .ewm(span=min(window, ewma_span), min_periods=1)
-                    .mean()
-                )
-                team_df[f'rolling_{window}_win_pct'] = (
-                    (team_df['team_score'] > team_df['opponent_score']).astype(float)
-                    .ewm(span=min(window, ewma_span), min_periods=1)
-                    .mean()
-                )
-            else:
-                # Simple moving average (original implementation)
-                team_df[f'rolling_{window}_runs_scored'] = (
-                    team_df['team_score']
-                    .rolling(window=window, min_periods=1)
-                    .mean()
-                )
-                team_df[f'rolling_{window}_runs_allowed'] = (
-                    team_df['opponent_score']
-                    .rolling(window=window, min_periods=1)
-                    .mean()
-                )
-                team_df[f'rolling_{window}_win_pct'] = (
-                    (team_df['team_score'] > team_df['opponent_score'])
-                    .rolling(window=window, min_periods=1)
-                    .mean()
-                )
-            
-            # IMPROVEMENT: Add home/away splits
-            # Teams often perform differently at home vs on the road
-            team_df[f'rolling_{window}_home_win_pct'] = (
-                (team_df['team_score'] > team_df['opponent_score']) & (team_df['is_home'] == 1)
-            ).rolling(window=window, min_periods=1).mean()
-            
-            team_df[f'rolling_{window}_away_win_pct'] = (
-                (team_df['team_score'] > team_df['opponent_score']) & (team_df['is_home'] == 0)
-            ).rolling(window=window, min_periods=1).mean()
-            
-            # TODO: Add rolling stats for:
-            # - Pythagenpat expected win% (run differential based)
-            # - vs. specific divisions
-            # - Recent streak (last 3-5 games)
-        
-        team_groups[team] = team_df
-    
-    # Merge rolling stats back into game data
-    feature_rows = _merge_rolling_stats(df, team_groups, window_sizes)
-    
-    # Create final feature DataFrame
-    feature_df = pd.DataFrame(feature_rows)
-    
+    long_stats = _build_team_long_stats(df, window_sizes, use_ewma, ewma_span)
+
+    # TODO: Add rolling stats for:
+    # - Pythagenpat expected win% (run differential based)
+    # - vs. specific divisions
+    # - Recent streak (last 3-5 games)
+
+    # Merge rolling stats back into game data (drops games where either
+    # team has no prior history yet, matching the original behavior)
+    feature_df = _merge_rolling_stats(df, long_stats, window_sizes)
+
     # === Derived comparison features ===
     for window in window_sizes:
         # Run differential features
@@ -363,109 +312,147 @@ def engineer_features(data: pd.DataFrame,
     return feature_df
 
 
-def _build_team_histories(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+def _build_team_long_stats(df: pd.DataFrame,
+                           window_sizes: List[int],
+                           use_ewma: bool,
+                           ewma_span: int) -> pd.DataFrame:
     """
-    Build separate DataFrames for each team's game history.
-    
-    Helper function to create team-specific views of the data
-    for calculating rolling statistics.
+    Build a long-format (one row per team-game) history with rolling
+    performance stats, used to attach each team's "as of just before this
+    game" stats back onto the game-level DataFrame via merge_asof.
+
+    Replaces a previous per-team dict + per-row iterrows() lookup, which
+    was O(n^2) (every game re-filtered each team's full history) and took
+    minutes on a full multi-season dataset. This computes the same rolling
+    values with vectorized groupby/rolling/ewm calls.
     """
-    team_groups = {}
-    
-    # Get all unique teams
-    all_teams = set(df['home_team'].unique()) | set(df['visiting_team'].unique())
-    
-    for team in all_teams:
-        # Get games where team is home
-        home_games = df[df['home_team'] == team].copy()
-        home_games['team_score'] = home_games['home_score']
-        home_games['opponent_score'] = home_games['visiting_score']
-        home_games['is_home'] = 1
-        
-        # Get games where team is away
-        away_games = df[df['visiting_team'] == team].copy()
-        away_games['team_score'] = away_games['visiting_score']
-        away_games['opponent_score'] = away_games['home_score']
-        away_games['is_home'] = 0
-        
-        # Combine and sort by date
-        team_games = pd.concat([home_games, away_games])
-        team_games = team_games.sort_values(by='game_date')
-        
-        team_groups[team] = team_games
-    
-    return team_groups
+    home = pd.DataFrame({
+        'game_date': df['game_date'].values,
+        'team': df['home_team'].values,
+        'team_score': df['home_score'].values,
+        'opponent_score': df['visiting_score'].values,
+        'is_home': 1,
+    })
+    away = pd.DataFrame({
+        'game_date': df['game_date'].values,
+        'team': df['visiting_team'].values,
+        'team_score': df['visiting_score'].values,
+        'opponent_score': df['home_score'].values,
+        'is_home': 0,
+    })
+    long_df = pd.concat([home, away], ignore_index=True)
+    # Sort each team's games chronologically so rolling/ewm windows are
+    # computed in the right order.
+    long_df = long_df.sort_values(['team', 'game_date'], kind='mergesort').reset_index(drop=True)
+
+    won = long_df['team_score'] > long_df['opponent_score']
+    long_df['won'] = won.astype(int)
+    long_df['home_win'] = (won & (long_df['is_home'] == 1)).astype(int)
+    long_df['away_win'] = (won & (long_df['is_home'] == 0)).astype(int)
+
+    grp = long_df.groupby('team', sort=False)
+    for window in window_sizes:
+        if use_ewma:
+            # Exponentially weighted moving average - recent games matter more
+            # span parameter controls the decay rate (higher = slower decay)
+            span = min(window, ewma_span)
+            long_df[f'rolling_{window}_runs_scored'] = grp['team_score'].transform(
+                lambda s: s.ewm(span=span, min_periods=1).mean())
+            long_df[f'rolling_{window}_runs_allowed'] = grp['opponent_score'].transform(
+                lambda s: s.ewm(span=span, min_periods=1).mean())
+            long_df[f'rolling_{window}_win_pct'] = grp['won'].transform(
+                lambda s: s.ewm(span=span, min_periods=1).mean())
+        else:
+            # Simple moving average (original implementation)
+            long_df[f'rolling_{window}_runs_scored'] = grp['team_score'].transform(
+                lambda s: s.rolling(window=window, min_periods=1).mean())
+            long_df[f'rolling_{window}_runs_allowed'] = grp['opponent_score'].transform(
+                lambda s: s.rolling(window=window, min_periods=1).mean())
+            long_df[f'rolling_{window}_win_pct'] = grp['won'].transform(
+                lambda s: s.rolling(window=window, min_periods=1).mean())
+
+        # IMPROVEMENT: Add home/away splits
+        # Teams often perform differently at home vs on the road
+        long_df[f'rolling_{window}_home_win_pct'] = grp['home_win'].transform(
+            lambda s: s.rolling(window=window, min_periods=1).mean())
+        long_df[f'rolling_{window}_away_win_pct'] = grp['away_win'].transform(
+            lambda s: s.rolling(window=window, min_periods=1).mean())
+
+    return long_df
 
 
-def _merge_rolling_stats(df: pd.DataFrame, 
-                         team_groups: Dict[str, pd.DataFrame],
-                         window_sizes: List[int]) -> List[Dict]:
+def _merge_rolling_stats(df: pd.DataFrame,
+                         long_stats: pd.DataFrame,
+                         window_sizes: List[int]) -> pd.DataFrame:
     """
-    Merge rolling statistics back into the main game DataFrame.
-    
-    For each game, we need to look up the rolling stats for both teams
-    as of just before that game (to avoid data leakage).
+    Attach each team's rolling performance stats "as of just before this
+    game" onto the game-level DataFrame.
+
+    Uses merge_asof (direction='backward', allow_exact_matches=False) to
+    find, for each team, its most recent game strictly before the current
+    one - the same "prevent data leakage" semantics as the original
+    per-row filter (`team_history['game_date'] < game_date`), but as a
+    single vectorized sorted-merge per side instead of one DataFrame
+    filter per game.
     """
-    feature_rows = []
-    
-    for _, game in df.iterrows():
-        home_team = game['home_team']
-        visiting_team = game['visiting_team']
-        game_date = game['game_date']
-        
-        # Get teams' stats before this game (crucial for preventing data leakage)
-        home_team_previous = team_groups[home_team][
-            team_groups[home_team]['game_date'] < game_date
+    stat_cols = []
+    for window in window_sizes:
+        stat_cols += [
+            f'rolling_{window}_runs_scored',
+            f'rolling_{window}_runs_allowed',
+            f'rolling_{window}_win_pct',
+            f'rolling_{window}_home_win_pct',
+            f'rolling_{window}_away_win_pct',
         ]
-        visiting_team_previous = team_groups[visiting_team][
-            team_groups[visiting_team]['game_date'] < game_date
-        ]
-        
-        # Only include games where both teams have history
-        if not home_team_previous.empty and not visiting_team_previous.empty:
-            home_team_stats = home_team_previous.iloc[-1].copy()
-            visiting_team_stats = visiting_team_previous.iloc[-1].copy()
-            
-            # Create new row with game data + rolling stats
-            new_row = game.copy()
-            
-            for window in window_sizes:
-                # Add home team rolling stats
-                new_row[f'home_rolling_{window}_runs_scored'] = (
-                    home_team_stats[f'rolling_{window}_runs_scored']
-                )
-                new_row[f'home_rolling_{window}_runs_allowed'] = (
-                    home_team_stats[f'rolling_{window}_runs_allowed']
-                )
-                new_row[f'home_rolling_{window}_win_pct'] = (
-                    home_team_stats[f'rolling_{window}_win_pct']
-                )
-                
-                # Add visiting team rolling stats
-                new_row[f'visiting_rolling_{window}_runs_scored'] = (
-                    visiting_team_stats[f'rolling_{window}_runs_scored']
-                )
-                new_row[f'visiting_rolling_{window}_runs_allowed'] = (
-                    visiting_team_stats[f'rolling_{window}_runs_allowed']
-                )
-                new_row[f'visiting_rolling_{window}_win_pct'] = (
-                    visiting_team_stats[f'rolling_{window}_win_pct']
-                )
-                
-                # IMPROVEMENT: Add home/away splits
-                # Check if columns exist (they may not with simple average)
-                if f'rolling_{window}_home_win_pct' in home_team_stats.index:
-                    new_row[f'home_rolling_{window}_home_win_pct'] = (
-                        home_team_stats[f'rolling_{window}_home_win_pct']
-                    )
-                if f'rolling_{window}_away_win_pct' in visiting_team_stats.index:
-                    new_row[f'visiting_rolling_{window}_away_win_pct'] = (
-                        visiting_team_stats[f'rolling_{window}_away_win_pct']
-                    )
-            
-            feature_rows.append(new_row)
-    
-    return feature_rows
+    stat_cols = [c for c in stat_cols if c in long_stats.columns]
+
+    # merge_asof requires both frames sorted ascending by the 'on' column.
+    long_sorted = long_stats.sort_values('game_date', kind='mergesort').reset_index(drop=True)
+    working = df.sort_values('game_date', kind='mergesort').reset_index(drop=True)
+    lookup = long_sorted[['game_date', 'team'] + stat_cols]
+
+    home_matched = pd.merge_asof(
+        working[['game_date', 'home_team']],
+        lookup,
+        on='game_date', left_by='home_team', right_by='team',
+        direction='backward', allow_exact_matches=False,
+    )
+    visiting_matched = pd.merge_asof(
+        working[['game_date', 'visiting_team']],
+        lookup,
+        on='game_date', left_by='visiting_team', right_by='team',
+        direction='backward', allow_exact_matches=False,
+    )
+
+    # Only include games where both teams already have prior history,
+    # matching the original behavior.
+    have_history = home_matched['team'].notna() & visiting_matched['team'].notna()
+
+    feature_df = working.loc[have_history].reset_index(drop=True).copy()
+    home_matched = home_matched.loc[have_history].reset_index(drop=True)
+    visiting_matched = visiting_matched.loc[have_history].reset_index(drop=True)
+
+    for window in window_sizes:
+        feature_df[f'home_rolling_{window}_runs_scored'] = home_matched[f'rolling_{window}_runs_scored']
+        feature_df[f'home_rolling_{window}_runs_allowed'] = home_matched[f'rolling_{window}_runs_allowed']
+        feature_df[f'home_rolling_{window}_win_pct'] = home_matched[f'rolling_{window}_win_pct']
+
+        feature_df[f'visiting_rolling_{window}_runs_scored'] = visiting_matched[f'rolling_{window}_runs_scored']
+        feature_df[f'visiting_rolling_{window}_runs_allowed'] = visiting_matched[f'rolling_{window}_runs_allowed']
+        feature_df[f'visiting_rolling_{window}_win_pct'] = visiting_matched[f'rolling_{window}_win_pct']
+
+        # IMPROVEMENT: Add home/away splits (asymmetric by design: the
+        # home team's rolling *home* win% and the visiting team's rolling
+        # *away* win%, mirroring the optional features modeling.py looks for)
+        home_split_col = f'rolling_{window}_home_win_pct'
+        if home_split_col in home_matched.columns:
+            feature_df[f'home_rolling_{window}_home_win_pct'] = home_matched[home_split_col]
+
+        away_split_col = f'rolling_{window}_away_win_pct'
+        if away_split_col in visiting_matched.columns:
+            feature_df[f'visiting_rolling_{window}_away_win_pct'] = visiting_matched[away_split_col]
+
+    return feature_df
 
 
 def calculate_game_features(home_team: str,

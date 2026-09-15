@@ -11,7 +11,7 @@ TODO: Implement ensemble methods
 
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split, GridSearchCV, TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -54,9 +54,37 @@ def prepare_model_data(feature_df: pd.DataFrame,
     - No separate validation set for hyperparameter tuning
     - Not accounting for seasonal effects (playoff vs regular season)
     
-    TODO: Implement walk-forward validation for more robust evaluation
-    TODO: Add cross-validation that respects temporal ordering
     TODO: Create separate validation set for hyperparameter tuning
+
+    For a more robust, multi-fold evaluation of the same chronological-
+    ordering constraint, see walk_forward_validation() below.
+    """
+    X, y = _select_features(feature_df, min_year)
+
+    # CRITICAL: Chronological split for time series data
+    # We use the first 80% for training and last 20% for testing
+    # This simulates real-world usage where we predict future games
+    train_cutoff = int(len(X) * (1 - test_size))
+    X_train, X_test = X.iloc[:train_cutoff], X.iloc[train_cutoff:]
+    y_train, y_test = y.iloc[:train_cutoff], y.iloc[train_cutoff:]
+
+    print(f"Training data shape: {X_train.shape}")
+    print(f"Testing data shape: {X_test.shape}")
+    print(f"Class balance in training: {y_train.mean():.3f} (home win rate)")
+    print(f"Class balance in testing: {y_test.mean():.3f} (home win rate)")
+
+    # TODO: Check for class imbalance and consider SMOTE or class weights
+    # Baseball typically has ~54% home win rate, so slight imbalance exists
+
+    return X_train, X_test, y_train, y_test
+
+
+def _select_features(feature_df: pd.DataFrame, min_year: int) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Select the model's feature columns and target from engineered features,
+    restricted to seasons >= min_year. Shared by prepare_model_data (single
+    chronological split) and walk_forward_validation (multiple expanding
+    chronological splits) so both use the same feature set.
     """
     # Feature selection
     # These are the core features that have proven predictive
@@ -134,23 +162,8 @@ def prepare_model_data(feature_df: pd.DataFrame,
     
     X = recent_data[available_features]
     y = recent_data['home_win']
-    
-    # CRITICAL: Chronological split for time series data
-    # We use the first 80% for training and last 20% for testing
-    # This simulates real-world usage where we predict future games
-    train_cutoff = int(len(X) * (1 - test_size))
-    X_train, X_test = X.iloc[:train_cutoff], X.iloc[train_cutoff:]
-    y_train, y_test = y.iloc[:train_cutoff], y.iloc[train_cutoff:]
-    
-    print(f"Training data shape: {X_train.shape}")
-    print(f"Testing data shape: {X_test.shape}")
-    print(f"Class balance in training: {y_train.mean():.3f} (home win rate)")
-    print(f"Class balance in testing: {y_test.mean():.3f} (home win rate)")
-    
-    # TODO: Check for class imbalance and consider SMOTE or class weights
-    # Baseball typically has ~54% home win rate, so slight imbalance exists
-    
-    return X_train, X_test, y_train, y_test
+
+    return X, y
 
 
 def train_model(X_train: pd.DataFrame, 
@@ -255,17 +268,20 @@ def train_model(X_train: pd.DataFrame,
         # Note: GradientBoostingClassifier doesn't support class_weight directly
         # For class imbalance, we could use sample_weight in fit() or try different models
         # Keeping this simple for now, but documenting the limitation
-        
+
         # TODO: Use RandomizedSearchCV for faster search with more parameters
         # TODO: Implement Bayesian optimization for more efficient search
-        
-        # Perform grid search with cross-validation
-        # Note: cv=5 may not respect temporal ordering - consider TimeSeriesSplit
-        # TODO: Replace with TimeSeriesSplit for proper time series CV
+
+        # Perform grid search with cross-validation.
+        # X_train/y_train are already in chronological order (prepare_model_data
+        # never shuffles), so TimeSeriesSplit gives each fold's validation set
+        # strictly after its training set - a plain KFold would let the model
+        # tune hyperparameters using "future" games to predict "past" ones.
+        n_splits = min(5, max(2, len(X_train) // 50))
         grid = GridSearchCV(
-            pipeline, 
-            param_grid, 
-            cv=5,  # TODO: Use TimeSeriesSplit instead
+            pipeline,
+            param_grid,
+            cv=TimeSeriesSplit(n_splits=n_splits),
             scoring='neg_log_loss',  # Better for probability calibration than accuracy
             n_jobs=-1,
             verbose=1
@@ -313,11 +329,21 @@ def train_model(X_train: pd.DataFrame,
             base_model = pipeline.fit(X_train_sub, y_train_sub)
         
         # Now calibrate on held-out calibration set
-        calibrated_model = CalibratedClassifierCV(
-            base_model,
-            method='isotonic',  # Isotonic regression for tree models
-            cv='prefit'  # Model already trained
-        )
+        # scikit-learn >=1.6 removed cv='prefit' in favor of wrapping the
+        # already-fitted estimator in FrozenEstimator; fall back to the old
+        # API for older installations.
+        try:
+            from sklearn.frozen import FrozenEstimator
+            calibrated_model = CalibratedClassifierCV(
+                FrozenEstimator(base_model),
+                method='isotonic',  # Isotonic regression for tree models
+            )
+        except ImportError:
+            calibrated_model = CalibratedClassifierCV(
+                base_model,
+                method='isotonic',
+                cv='prefit'  # Model already trained
+            )
         calibrated_model.fit(X_cal, y_cal)
         model = calibrated_model
         print("✅ Calibration complete - probabilities should be more accurate")
@@ -396,8 +422,101 @@ def evaluate_model(model: Pipeline,
     # TODO: Add confusion matrix analysis
     # TODO: Plot ROC curve and precision-recall curve
     # TODO: Analyze predictions by confidence level
-    
+
     return metrics
+
+
+def walk_forward_validation(feature_df: pd.DataFrame,
+                            n_splits: int = 5,
+                            min_year: int = 2010,
+                            grid_search: bool = False,
+                            random_state: int = 42) -> Dict:
+    """
+    Evaluate the model with expanding-window walk-forward validation.
+
+    prepare_model_data() gives a single chronological 80/20 split: one
+    train window, one test window. That's a reasonable quick check, but
+    it's one sample - performance on that particular test window could be
+    unusually good or bad by chance. Walk-forward validation instead
+    carves the season-ordered data into n_splits chronological folds
+    (via TimeSeriesSplit): fold i trains on everything before it and
+    tests on the fold right after, so every fold's test set is still
+    strictly in the future relative to its training set (no leakage),
+    and the reported metrics are an average over multiple such
+    train/test boundaries instead of one.
+
+    Parameters
+    ----------
+    feature_df : pd.DataFrame
+        DataFrame with engineered features (output of engineer_features)
+    n_splits : int, optional
+        Number of expanding-window folds (default: 5)
+    min_year : int, optional
+        Minimum season to include (default: 2010)
+    grid_search : bool, optional
+        Whether to grid search hyperparameters within each fold (default:
+        False - grid searching n_splits times over is expensive; the
+        single-split prepare_model_data()/train_model(grid_search=True)
+        path is the place to tune hyperparameters)
+    random_state : int, optional
+        Random seed passed through to train_model
+
+    Returns
+    -------
+    dict
+        'folds': list of per-fold metric dicts (each augmented with
+            'train_size' and 'test_size')
+        'mean': metrics averaged across folds
+        'std': per-metric standard deviation across folds
+
+    TODO: Support calibration inside each fold (currently disabled for
+    speed - see train_model(calibrate=...))
+    """
+    X, y = _select_features(feature_df, min_year)
+
+    splitter = TimeSeriesSplit(n_splits=n_splits)
+
+    fold_metrics = []
+    print(f"\nRunning walk-forward validation ({n_splits} folds)...")
+    print("=" * 70)
+
+    for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        print(f"\nFold {fold_idx}/{n_splits}: train={len(X_train)} games, "
+              f"test={len(X_test)} games")
+
+        model = train_model(X_train, y_train, grid_search=grid_search,
+                            random_state=random_state, calibrate=False)
+
+        y_pred = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+        metrics = {
+            'accuracy': accuracy_score(y_test, y_pred),
+            'roc_auc': roc_auc_score(y_test, y_pred_proba),
+            'brier_score': brier_score_loss(y_test, y_pred_proba),
+            'log_loss': log_loss(y_test, y_pred_proba),
+            'train_size': len(X_train),
+            'test_size': len(X_test),
+        }
+        fold_metrics.append(metrics)
+        print(f"  accuracy={metrics['accuracy']:.4f}  roc_auc={metrics['roc_auc']:.4f}  "
+              f"brier={metrics['brier_score']:.4f}  log_loss={metrics['log_loss']:.4f}")
+
+    metric_names = ['accuracy', 'roc_auc', 'brier_score', 'log_loss']
+    mean_metrics = {m: float(np.mean([f[m] for f in fold_metrics])) for m in metric_names}
+    std_metrics = {m: float(np.std([f[m] for f in fold_metrics])) for m in metric_names}
+
+    print("\n" + "=" * 70)
+    print("WALK-FORWARD VALIDATION SUMMARY")
+    print("=" * 70)
+    for m in metric_names:
+        print(f"{m:.<20} {mean_metrics[m]:.4f} (+/- {std_metrics[m]:.4f})")
+    print("=" * 70)
+
+    return {'folds': fold_metrics, 'mean': mean_metrics, 'std': std_metrics}
 
 
 def feature_importance(model: Pipeline) -> pd.DataFrame:
@@ -438,9 +557,24 @@ def feature_importance(model: Pipeline) -> pd.DataFrame:
         return None
     
     try:
-        # Get feature names and importances from the classifier step
-        feature_names = model.named_steps['classifier'].feature_names_in_
-        importances = model.named_steps['classifier'].feature_importances_
+        # When probability calibration is enabled, `model` is a
+        # CalibratedClassifierCV wrapping the underlying Pipeline(s) rather
+        # than a Pipeline itself, so `named_steps` isn't available directly.
+        # Unwrap to the fitted pipeline used by the first calibrator.
+        pipeline = model
+        if hasattr(model, 'calibrated_classifiers_'):
+            base_estimator = model.calibrated_classifiers_[0].estimator
+            pipeline = getattr(base_estimator, 'estimator', base_estimator)
+
+        # Get feature names and importances. Note: feature names come from
+        # the *pipeline* (which delegates to its first step, the scaler),
+        # not the classifier step - inside a Pipeline, the classifier is
+        # fit on the scaler's plain ndarray output, so it never sees
+        # column names and has no feature_names_in_ of its own.
+        # feature_importances_ is still read from the classifier itself,
+        # in the same column order the scaler passed it.
+        feature_names = pipeline.named_steps['scaler'].feature_names_in_
+        importances = pipeline.named_steps['classifier'].feature_importances_
         
         # Create DataFrame
         importance_df = pd.DataFrame({
