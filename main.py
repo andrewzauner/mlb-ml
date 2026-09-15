@@ -33,9 +33,14 @@ def parse_args():
         help="Skip hyperparameter grid search and use fixed defaults (much faster)"
     )
     parser.add_argument(
-        '--model-type', type=str, default='gbm', choices=['gbm', 'xgboost'],
-        help="Classifier backend: 'gbm' (sklearn, default) or 'xgboost' "
-             "(requires the optional xgboost package)"
+        '--model-type', type=str, default='gbm', choices=['gbm', 'xgboost', 'ensemble'],
+        help="Classifier backend: 'gbm' (sklearn, default), 'xgboost' "
+             "(requires the optional xgboost package), or 'ensemble' "
+             "(averages gbm + xgboost predicted probabilities)"
+    )
+    parser.add_argument(
+        '--shap', action='store_true',
+        help="Also compute SHAP-based feature importance (requires the optional shap package)"
     )
     parser.add_argument(
         '--no-betting', action='store_true',
@@ -83,7 +88,8 @@ def main():
             test_size=0.2,
             grid_search=not args.no_grid_search,
             evaluate_betting=not args.no_betting,
-            model_type=args.model_type
+            model_type=args.model_type,
+            compute_shap=args.shap
         )
         if args.save_model:
             pipeline.save_model(mlb_predictor.model, args.save_model)

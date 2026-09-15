@@ -64,6 +64,8 @@ python main.py --years 2018 2022              # season range (default: 2018-2022
 python main.py --no-grid-search                # skip hyperparameter search (much faster)
 python main.py --no-betting                     # skip the betting simulation
 python main.py --model-type xgboost             # use XGBoost instead of sklearn's GBM
+python main.py --model-type ensemble            # average GBM + XGBoost predictions
+python main.py --shap                           # also compute SHAP-based feature importance
 python main.py --save-model ./model.pkl         # save the trained model after training
 python main.py --load-model ./model.pkl         # reuse a saved model instead of retraining
 python main.py --data-dir ./data                # where Retrosheet files live/are cached
@@ -168,10 +170,16 @@ importance = predictor.feature_importance()
 - Optional XGBoost backend alongside the default GradientBoostingClassifier - pass
   `model_type='xgboost'` (or `main.py --model-type xgboost`); falls back to the sklearn model with
   a warning if `xgboost` isn't installed
+- Simple ensemble (`model_type='ensemble'`) that trains both the GBM and XGBoost backends and
+  averages their predicted probabilities (`modeling.AveragingEnsembleClassifier`) - equal-weight
+  averaging, not stacking
 - Calibration/reliability diagnostics via `modeling.calibration_report()` - per-bin predicted vs.
   actual win rate, plus Expected Calibration Error (ECE)
 - Multiple evaluation metrics (accuracy, AUC, Brier score, log loss)
-- Feature importance analysis
+- Feature importance analysis: the fast, built-in (impurity-based) importances via
+  `feature_importance()`, or `shap_feature_importance()` for SHAP values, which also show
+  *direction* of effect (e.g. "higher rest-day advantage pushes toward a home win") - both work
+  transparently with the ensemble, averaging across its members
 - **BUG FIX**: probability calibration and feature-importance extraction now work with current
   scikit-learn (`CalibratedClassifierCV(cv='prefit')` was removed upstream; feature importance
   was reading feature names off the wrong pipeline step)
@@ -235,10 +243,12 @@ The code includes extensive TODO comments marking oversimplifications. Key areas
 ### Lower Priority (But Still Important)
 7. ~~Walk-forward validation~~ - done, see `modeling.walk_forward_validation()`
 8. ~~Calibration curves~~ - done, see `modeling.calibration_report()` (ECE + per-bin reliability table)
-9. SHAP values for feature importance
+9. ~~SHAP values for feature importance~~ - done, see `modeling.shap_feature_importance()` (optional `shap` dependency)
 10. Injury/roster data
 11. Weather features
-12. Multiple model ensemble
+12. ~~Multiple model ensemble~~ - done (simple probability averaging), see `model_type='ensemble'` /
+    `modeling.AveragingEnsembleClassifier`. Still a TODO: weighted averaging or stacking with a
+    meta-learner instead of equal weights
 
 ## Extending the Model
 

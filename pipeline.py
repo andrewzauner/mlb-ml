@@ -26,7 +26,8 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
                           grid_search: bool = True,
                           evaluate_betting: bool = True,
                           model_path: Optional[str] = None,
-                          model_type: str = 'gbm') -> Dict:
+                          model_type: str = 'gbm',
+                          compute_shap: bool = False) -> Dict:
     """
     Run the complete model pipeline from data download to evaluation.
     
@@ -58,7 +59,11 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         If given, save the trained model pipeline to this path (via
         joblib) after training completes.
     model_type : str, optional
-        'gbm' (default) or 'xgboost' - see modeling.train_model
+        'gbm' (default), 'xgboost', or 'ensemble' - see modeling.train_model
+    compute_shap : bool, optional
+        Whether to also compute SHAP-based feature importance (default:
+        False - requires the optional `shap` package and adds runtime;
+        the built-in feature_importance() always runs regardless)
 
     Returns
     -------
@@ -68,6 +73,7 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         - 'game_data': Historical game data
         - 'metrics': Model evaluation metrics
         - 'feature_importance': Feature importance DataFrame
+        - 'shap_importance': SHAP-based feature importance DataFrame (None unless compute_shap=True)
         - 'calibration': Calibration/reliability report (see modeling.calibration_report)
         - 'betting_results': Betting performance metrics (if evaluate_betting=True)
         
@@ -163,6 +169,11 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     importance_df = modeling.feature_importance(model)
     print()
 
+    shap_importance_df = None
+    if compute_shap:
+        shap_importance_df = modeling.shap_feature_importance(model, X_test)
+        print()
+
     calibration = modeling.calibration_report(model, X_test, y_test)
     print()
     
@@ -198,6 +209,7 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         'game_data': game_data,
         'metrics': metrics,
         'feature_importance': importance_df,
+        'shap_importance': shap_importance_df,
         'calibration': calibration,
         'betting_results': betting_results,
         'test_data': (X_test, y_test)

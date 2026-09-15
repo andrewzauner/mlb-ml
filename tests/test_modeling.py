@@ -150,6 +150,38 @@ def test_calibration_report_detects_overconfident_model():
     assert report['ece'] > 0.3
 
 
+def test_shap_feature_importance_basic():
+    pytest.importorskip('shap')
+    rng = np.random.RandomState(0)
+    n = 60
+    X_train = pd.DataFrame(rng.rand(n, 4), columns=['a', 'b', 'c', 'd'])
+    y_train = pd.Series(rng.randint(0, 2, size=n))
+
+    model = modeling.train_model(X_train, y_train, grid_search=False, calibrate=False)
+    result = modeling.shap_feature_importance(model, X_train, max_samples=30)
+
+    assert result is not None
+    assert set(['feature', 'mean_abs_shap', 'mean_shap']) <= set(result.columns)
+    assert set(result['feature']) == {'a', 'b', 'c', 'd'}
+    assert (result['mean_abs_shap'] >= 0).all()
+
+
+def test_shap_feature_importance_averages_ensemble_members():
+    pytest.importorskip('shap')
+    pytest.importorskip('xgboost')
+    rng = np.random.RandomState(0)
+    n = 60
+    X_train = pd.DataFrame(rng.rand(n, 4), columns=['a', 'b', 'c', 'd'])
+    y_train = pd.Series(rng.randint(0, 2, size=n))
+
+    model = modeling.train_model(X_train, y_train, grid_search=False,
+                                 calibrate=False, model_type='ensemble')
+    result = modeling.shap_feature_importance(model, X_train, max_samples=30)
+
+    assert result is not None
+    assert set(result['feature']) == {'a', 'b', 'c', 'd'}
+
+
 def test_build_classifier_gbm():
     from sklearn.ensemble import GradientBoostingClassifier
     classifier, param_grid = modeling._build_classifier('gbm', random_state=42, tuned=False)
@@ -183,6 +215,50 @@ def test_train_model_applies_sample_weight_without_crashing():
 
     preds = model.predict_proba(X_train)
     assert preds.shape == (n, 2)
+
+
+def test_averaging_ensemble_classifier_averages_member_probabilities():
+    class _Stub:
+        def __init__(self, probs):
+            self._probs = np.asarray(probs)
+            self.feature_names_in_ = np.array(['a', 'b'])
+
+        def predict_proba(self, X):
+            return np.column_stack([1 - self._probs, self._probs])
+
+    ensemble = modeling.AveragingEnsembleClassifier([_Stub([0.2, 0.8]), _Stub([0.6, 0.6])])
+
+    proba = ensemble.predict_proba(None)
+
+    assert proba[:, 1] == pytest.approx([0.4, 0.7])
+    assert list(ensemble.predict(None)) == [0, 1]  # 0.4 < 0.5, 0.7 >= 0.5
+    assert list(ensemble.feature_names_in_) == ['a', 'b']  # delegates to first member
+
+
+def test_averaging_ensemble_classifier_requires_at_least_one_model():
+    with pytest.raises(ValueError):
+        modeling.AveragingEnsembleClassifier([])
+
+
+def test_train_model_ensemble_returns_working_averaging_classifier():
+    pytest.importorskip('xgboost')
+    rng = np.random.RandomState(0)
+    n = 80
+    X_train = pd.DataFrame(rng.rand(n, 4), columns=['a', 'b', 'c', 'd'])
+    y_train = pd.Series(rng.randint(0, 2, size=n))
+
+    model = modeling.train_model(X_train, y_train, grid_search=False,
+                                 calibrate=False, model_type='ensemble')
+
+    assert isinstance(model, modeling.AveragingEnsembleClassifier)
+    assert len(model.models) == 2
+    preds = model.predict_proba(X_train)
+    assert preds.shape == (n, 2)
+    # feature_importance() and shap_feature_importance() must handle the
+    # ensemble case (averaging across members) without crashing.
+    importance_df = modeling.feature_importance(model)
+    assert importance_df is not None
+    assert set(importance_df['feature']) == {'a', 'b', 'c', 'd'}
 
 
 def test_train_model_unknown_model_type_raises():

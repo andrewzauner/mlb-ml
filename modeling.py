@@ -165,6 +165,46 @@ def _select_features(feature_df: pd.DataFrame, min_year: int) -> Tuple[pd.DataFr
     return X, y
 
 
+class AveragingEnsembleClassifier:
+    """
+    Combines several already-trained classifiers by averaging their
+    predicted probabilities - the "multiple model ensemble" idea in its
+    simplest form (equal-weight averaging, no stacking/meta-learner).
+
+    Each member can be a plain sklearn Pipeline or a calibrated model
+    (CalibratedClassifierCV); this only relies on predict_proba(), so it
+    works with anything train_model() returns.
+
+    Implements enough of the sklearn estimator interface (predict_proba,
+    predict, feature_names_in_) to be a drop-in replacement for a single
+    model everywhere else in this project uses one - evaluate_model(),
+    calibration_report(), and betting.evaluate_betting_performance() all
+    only call predict()/predict_proba() and work unmodified; predict.py's
+    predict_game() additionally needs feature_names_in_, delegated here
+    to the first member (all members are trained on the same X_train, so
+    they expect the same feature columns in the same order).
+
+    TODO: Weighted averaging (e.g. by each member's validation log loss)
+    instead of equal weights
+    TODO: Stacking with a meta-learner instead of simple averaging
+    """
+    def __init__(self, models: list):
+        if not models:
+            raise ValueError("AveragingEnsembleClassifier needs at least one model")
+        self.models = models
+        self.classes_ = np.array([0, 1])
+
+    @property
+    def feature_names_in_(self):
+        return self.models[0].feature_names_in_
+
+    def predict_proba(self, X):
+        return np.mean([m.predict_proba(X) for m in self.models], axis=0)
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
 def _build_classifier(model_type: str, random_state: int, tuned: bool):
     """
     Construct the (untrained) classifier step for the given model_type.
@@ -259,15 +299,16 @@ def train_model(X_train: pd.DataFrame,
         Whether to calibrate probabilities using isotonic regression (default: True)
         IMPORTANT: Calibration improves probability estimates for betting
     model_type : str, optional
-        'gbm' (default) for sklearn's GradientBoostingClassifier, or
+        'gbm' (default) for sklearn's GradientBoostingClassifier,
         'xgboost' for XGBClassifier (requires the optional `xgboost`
         package - falls back to 'gbm' with a warning if it isn't
-        installed)
+        installed), or 'ensemble' to train both and average their
+        predicted probabilities (see AveragingEnsembleClassifier)
 
     Returns
     -------
-    sklearn.pipeline.Pipeline
-        Trained model pipeline
+    sklearn.pipeline.Pipeline or AveragingEnsembleClassifier
+        Trained model
 
     Notes
     -----
@@ -298,6 +339,25 @@ def train_model(X_train: pd.DataFrame,
     - Nested cross-validation for unbiased performance estimates
     """
     print("Training model...")
+
+    if model_type == 'ensemble':
+        member_types = ['gbm', 'xgboost']
+        try:
+            import xgboost  # noqa: F401
+        except ImportError:
+            print("xgboost is not installed (pip install xgboost) - "
+                  "ensemble will only use 'gbm' (no averaging benefit).")
+            member_types = ['gbm']
+
+        print(f"Training ensemble members: {member_types}")
+        members = [
+            train_model(X_train, y_train, grid_search=grid_search, random_state=random_state,
+                       use_class_weight=use_class_weight, calibrate=calibrate, model_type=mt)
+            for mt in member_types
+        ]
+        model = AveragingEnsembleClassifier(members)
+        print("Ensemble training complete.")
+        return model
 
     if model_type == 'xgboost':
         try:
@@ -668,35 +728,51 @@ def calibration_report(model: Pipeline,
     return {'bins': bins_df, 'ece': ece, 'max_calibration_error': max_calibration_error}
 
 
+def _unwrap_pipeline(model) -> Pipeline:
+    """
+    Get the underlying (scaler, classifier) Pipeline from a trained model.
+
+    When probability calibration is enabled, `model` is a
+    CalibratedClassifierCV wrapping the underlying Pipeline(s) rather than
+    a Pipeline itself, so `named_steps` isn't available directly on it.
+    This unwraps to the fitted pipeline used by the first calibrator - the
+    same one for every calibrator when calibrate=True used a single
+    FrozenEstimator/prefit base model rather than cv-fitting several.
+    """
+    if hasattr(model, 'calibrated_classifiers_'):
+        base_estimator = model.calibrated_classifiers_[0].estimator
+        return getattr(base_estimator, 'estimator', base_estimator)
+    return model
+
+
 def feature_importance(model: Pipeline) -> pd.DataFrame:
     """
     Extract and display feature importances from the trained model.
-    
+
     Parameters
     ----------
     model : sklearn.pipeline.Pipeline
         Trained model pipeline
-    
+
     Returns
     -------
     pd.DataFrame
         DataFrame with feature names and importance scores
-        
+
     Notes
     -----
     Feature importance helps identify which factors are most predictive.
-    
+    This uses each model's built-in (impurity-based) importances, which
+    are fast but biased toward high-cardinality features and don't show
+    the *direction* of a feature's effect. See shap_feature_importance()
+    for a more rigorous alternative.
+
     Expected top features (based on domain knowledge):
     1. Vegas implied probabilities (strongest signal)
     2. Recent win percentage
     3. Run differential
     4. Rest days advantage
-    
-    TODO: Implement SHAP values for better feature importance
-    - More accurate attribution than built-in importances
-    - Shows direction of effect (positive/negative)
-    - Can explain individual predictions
-    
+
     TODO: Analyze feature interactions
     - Which features work together?
     - Are there redundant features?
@@ -704,45 +780,168 @@ def feature_importance(model: Pipeline) -> pd.DataFrame:
     if model is None:
         print("Model not trained yet.")
         return None
-    
-    try:
-        # When probability calibration is enabled, `model` is a
-        # CalibratedClassifierCV wrapping the underlying Pipeline(s) rather
-        # than a Pipeline itself, so `named_steps` isn't available directly.
-        # Unwrap to the fitted pipeline used by the first calibrator.
-        pipeline = model
-        if hasattr(model, 'calibrated_classifiers_'):
-            base_estimator = model.calibrated_classifiers_[0].estimator
-            pipeline = getattr(base_estimator, 'estimator', base_estimator)
 
-        # Get feature names and importances. Note: feature names come from
-        # the *pipeline* (which delegates to its first step, the scaler),
-        # not the classifier step - inside a Pipeline, the classifier is
-        # fit on the scaler's plain ndarray output, so it never sees
-        # column names and has no feature_names_in_ of its own.
-        # feature_importances_ is still read from the classifier itself,
-        # in the same column order the scaler passed it.
+    if isinstance(model, AveragingEnsembleClassifier):
+        # Average each member's importances (aligned by feature name - all
+        # members were trained on the same X_train, so they share the same
+        # feature columns).
+        per_member = [_raw_feature_importance(m) for m in model.models]
+        per_member = [r for r in per_member if r is not None]
+        if not per_member:
+            print("Error extracting feature importances: no ensemble member returned importances.")
+            return None
+        feature_names = per_member[0][0]
+        importances = np.mean([imp for _, imp in per_member], axis=0)
+    else:
+        raw = _raw_feature_importance(model)
+        if raw is None:
+            return None
+        feature_names, importances = raw
+
+    importance_df = pd.DataFrame({
+        'feature': feature_names,
+        'importance': importances
+    }).sort_values('importance', ascending=False).reset_index(drop=True)
+
+    print("\nTop 15 Most Important Features:")
+    print("=" * 60)
+    for idx, row in importance_df.head(15).iterrows():
+        bar = '█' * int(row['importance'] * 200)  # Visual bar
+        print(f"{row['feature']:.<40} {row['importance']:.4f} {bar}")
+    print("=" * 60)
+
+    return importance_df
+
+
+def _raw_feature_importance(model) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Extract (feature_names, importances) from a single (non-ensemble)
+    trained model, without any printing. Shared by feature_importance()
+    and its ensemble-averaging path above.
+    """
+    try:
+        pipeline = _unwrap_pipeline(model)
+        # Feature names come from the *pipeline* (which delegates to its
+        # first step, the scaler), not the classifier step - inside a
+        # Pipeline, the classifier is fit on the scaler's plain ndarray
+        # output, so it never sees column names and has no
+        # feature_names_in_ of its own. feature_importances_ is still
+        # read from the classifier itself, in the same column order the
+        # scaler passed it.
         feature_names = pipeline.named_steps['scaler'].feature_names_in_
         importances = pipeline.named_steps['classifier'].feature_importances_
-        
-        # Create DataFrame
-        importance_df = pd.DataFrame({
-            'feature': feature_names,
-            'importance': importances
-        })
-        
-        # Sort by importance
-        importance_df = importance_df.sort_values('importance', ascending=False).reset_index(drop=True)
-        
-        print("\nTop 15 Most Important Features:")
-        print("=" * 60)
-        for idx, row in importance_df.head(15).iterrows():
-            bar = '█' * int(row['importance'] * 200)  # Visual bar
-            print(f"{row['feature']:.<40} {row['importance']:.4f} {bar}")
-        print("=" * 60)
-        
-        return importance_df
-        
+        return feature_names, importances
     except Exception as e:
         print(f"Error extracting feature importances: {e}")
+        return None
+
+
+def shap_feature_importance(model: Pipeline,
+                            X: pd.DataFrame,
+                            max_samples: int = 500,
+                            random_state: int = 42) -> Optional[pd.DataFrame]:
+    """
+    Compute SHAP-based feature importance and effect direction.
+
+    Unlike feature_importance()'s impurity-based scores, SHAP values are
+    computed per-prediction and can be averaged to show not just *how
+    much* a feature matters but *which direction* it tends to push
+    predictions (e.g. "more home rest days pushes toward a home win, on
+    average") - useful both for sanity-checking the model against
+    baseball intuition and for explaining individual predictions.
+
+    Parameters
+    ----------
+    model : sklearn.pipeline.Pipeline
+        Trained (optionally calibrated) prediction model
+    X : pd.DataFrame
+        Feature data to explain (e.g. X_test) - real games, not synthetic
+        rows, so the resulting importances reflect actual data patterns
+    max_samples : int, optional
+        SHAP's TreeExplainer is fast, but computing + printing importances
+        for very large X is unnecessary; randomly sample at most this many
+        rows (default: 500)
+    random_state : int, optional
+        Random seed for the row sample
+
+    Returns
+    -------
+    pd.DataFrame or None
+        Columns: 'feature', 'mean_abs_shap' (overall importance, use this
+        for ranking), 'mean_shap' (signed average - direction of effect).
+        None if the optional `shap` package isn't installed.
+
+    Notes
+    -----
+    TODO: Analyze feature interactions (SHAP interaction values)
+    TODO: Per-prediction explanations for predict_game()
+    """
+    if model is None:
+        print("Model not trained yet.")
+        return None
+
+    try:
+        import shap
+    except ImportError:
+        print("shap is not installed (pip install shap) - skipping SHAP analysis.")
+        return None
+
+    X_sample = X.sample(n=min(max_samples, len(X)), random_state=random_state) if len(X) > max_samples else X
+
+    members = model.models if isinstance(model, AveragingEnsembleClassifier) else [model]
+    per_member = [_raw_shap_importance(m, X_sample, shap) for m in members]
+    per_member = [r for r in per_member if r is not None]
+    if not per_member:
+        return None
+
+    mean_abs_shap = np.mean([r[0] for r in per_member], axis=0)
+    mean_shap = np.mean([r[1] for r in per_member], axis=0)
+
+    importance_df = pd.DataFrame({
+        'feature': X_sample.columns,
+        'mean_abs_shap': mean_abs_shap,
+        'mean_shap': mean_shap,
+    }).sort_values('mean_abs_shap', ascending=False).reset_index(drop=True)
+
+    print(f"\nSHAP Feature Importance (n={len(X_sample)} games"
+          f"{', averaged over ensemble members' if len(members) > 1 else ''}):")
+    print("=" * 70)
+    print(f"{'Feature':<40} {'|SHAP|':>10} {'Direction':>15}")
+    for _, row in importance_df.head(15).iterrows():
+        direction = '+ home win' if row['mean_shap'] > 0 else '+ away win'
+        print(f"{row['feature']:<40} {row['mean_abs_shap']:>10.4f} {direction:>15}")
+    print("=" * 70)
+
+    return importance_df
+
+
+def _raw_shap_importance(model, X_sample: pd.DataFrame, shap_module) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Compute (mean_abs_shap, mean_shap) for a single (non-ensemble) trained
+    model against X_sample, scaled with that model's own fitted scaler.
+    Shared by shap_feature_importance() and its ensemble-averaging path.
+    """
+    try:
+        pipeline = _unwrap_pipeline(model)
+        scaler = pipeline.named_steps['scaler']
+        classifier = pipeline.named_steps['classifier']
+
+        X_scaled = pd.DataFrame(scaler.transform(X_sample), columns=X_sample.columns, index=X_sample.index)
+
+        explainer = shap_module.TreeExplainer(classifier)
+        shap_values = explainer.shap_values(X_scaled)
+
+        # Different shap/model versions return shap_values in different
+        # shapes for binary classification: a plain (n, features) array
+        # for the positive class, a list of two such arrays
+        # [class0, class1], or a (n, features, 2) array. Normalize to the
+        # positive-class array.
+        if isinstance(shap_values, list):
+            shap_values = shap_values[1]
+        elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+            shap_values = shap_values[:, :, 1]
+
+        return np.abs(shap_values).mean(axis=0), shap_values.mean(axis=0)
+    except Exception as e:
+        print(f"Error computing SHAP values: {e}")
         return None

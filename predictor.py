@@ -223,7 +223,26 @@ class MLBPredictor:
             Feature importance scores
         """
         return modeling.feature_importance(self.model)
-    
+
+    def shap_feature_importance(self, X: pd.DataFrame, max_samples: int = 500) -> Optional[pd.DataFrame]:
+        """
+        Compute SHAP-based feature importance (overall importance plus
+        direction of effect). Requires the optional `shap` package.
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Feature data to explain (e.g. X_test)
+        max_samples : int, optional
+            Randomly sample at most this many rows for speed
+
+        Returns
+        -------
+        pd.DataFrame or None
+            None if `shap` isn't installed
+        """
+        return modeling.shap_feature_importance(self.model, X, max_samples=max_samples)
+
     def walk_forward_validation(self, feature_df: pd.DataFrame,
                                n_splits: int = 5,
                                grid_search: bool = False) -> Dict:
@@ -331,7 +350,8 @@ class MLBPredictor:
                              test_size: float = 0.2,
                              grid_search: bool = True,
                              evaluate_betting: bool = True,
-                             model_type: str = 'gbm') -> Dict:
+                             model_type: str = 'gbm',
+                             compute_shap: bool = False) -> Dict:
         """
         Run the complete pipeline from data download to evaluation.
 
@@ -346,7 +366,9 @@ class MLBPredictor:
         evaluate_betting : bool, optional
             Whether to evaluate betting performance
         model_type : str, optional
-            'gbm' (default) or 'xgboost' - see modeling.train_model
+            'gbm' (default), 'xgboost', or 'ensemble' - see modeling.train_model
+        compute_shap : bool, optional
+            Whether to also compute SHAP-based feature importance
 
         Returns
         -------
@@ -359,7 +381,8 @@ class MLBPredictor:
             test_size=test_size,
             grid_search=grid_search,
             evaluate_betting=evaluate_betting,
-            model_type=model_type
+            model_type=model_type,
+            compute_shap=compute_shap
         )
         
         # Store model and data for later use
