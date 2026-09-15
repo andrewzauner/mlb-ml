@@ -5,6 +5,15 @@ import pytest
 import modeling
 
 
+class _StubModel:
+    """Minimal stand-in for a fitted sklearn Pipeline's predict_proba."""
+    def __init__(self, home_win_probs):
+        self._probs = np.asarray(home_win_probs)
+
+    def predict_proba(self, X):
+        return np.column_stack([1 - self._probs, self._probs])
+
+
 REQUIRED_COLUMNS = [
     'home_implied_prob_normalized', 'away_implied_prob_normalized',
     'home_rolling_5_runs_scored', 'home_rolling_5_runs_allowed', 'home_rolling_5_win_pct',
@@ -86,3 +95,102 @@ def test_walk_forward_validation_returns_per_fold_and_summary_metrics():
     train_sizes = [f['train_size'] for f in results['folds']]
     assert train_sizes == sorted(train_sizes)
     assert train_sizes[0] < train_sizes[-1]
+
+
+def test_calibration_report_perfectly_calibrated_model_has_zero_ece():
+    # 10 games per predicted-probability bucket where the actual win rate
+    # exactly matches the predicted probability -> ECE should be ~0.
+    probs = np.concatenate([np.full(10, 0.2), np.full(10, 0.8)])
+    outcomes = np.concatenate([
+        np.array([1] * 2 + [0] * 8),  # 20% win rate, matches predicted 0.2
+        np.array([1] * 8 + [0] * 2),  # 80% win rate, matches predicted 0.8
+    ])
+    model = _StubModel(probs)
+    X_test = pd.DataFrame(index=range(len(probs)))
+    y_test = pd.Series(outcomes)
+
+    report = modeling.calibration_report(model, X_test, y_test, n_bins=10)
+
+    assert report['ece'] == pytest.approx(0.0, abs=1e-9)
+    assert set(['predicted_prob', 'actual_win_rate', 'gap', 'count']) <= set(report['bins'].columns)
+
+
+def test_calibration_report_handles_realistic_random_probabilities():
+    # Regression test: calibration_report used to compute its own bin
+    # counts with np.digitize while calibration_curve (sklearn) bins
+    # internally with np.searchsorted - the two disagree on values that
+    # land exactly on a bin edge, desyncing the two bin counts and
+    # crashing with a shape mismatch. Random probabilities exercise many
+    # more edge/bin configurations than a small handcrafted case would.
+    rng = np.random.RandomState(0)
+    n = 500
+    probs = rng.rand(n)
+    outcomes = (rng.rand(n) < probs).astype(int)
+    model = _StubModel(probs)
+    X_test = pd.DataFrame(index=range(n))
+    y_test = pd.Series(outcomes)
+
+    report = modeling.calibration_report(model, X_test, y_test, n_bins=10)
+
+    assert 0.0 <= report['ece'] <= 1.0
+    assert report['bins']['count'].sum() == n
+
+
+def test_calibration_report_detects_overconfident_model():
+    # Model always predicts 0.9 but is only right half the time -> should
+    # show a large calibration gap.
+    probs = np.full(20, 0.9)
+    outcomes = np.array([1] * 10 + [0] * 10)
+    model = _StubModel(probs)
+    X_test = pd.DataFrame(index=range(len(probs)))
+    y_test = pd.Series(outcomes)
+
+    report = modeling.calibration_report(model, X_test, y_test, n_bins=10)
+
+    assert report['ece'] > 0.3
+
+
+def test_build_classifier_gbm():
+    from sklearn.ensemble import GradientBoostingClassifier
+    classifier, param_grid = modeling._build_classifier('gbm', random_state=42, tuned=False)
+    assert isinstance(classifier, GradientBoostingClassifier)
+    assert 'classifier__n_estimators' in param_grid
+
+
+def test_build_classifier_xgboost():
+    xgboost = pytest.importorskip('xgboost')
+    classifier, param_grid = modeling._build_classifier('xgboost', random_state=42, tuned=True)
+    assert isinstance(classifier, xgboost.XGBClassifier)
+
+
+def test_build_classifier_unknown_type_raises():
+    with pytest.raises(ValueError):
+        modeling._build_classifier('not_a_real_model', random_state=42, tuned=False)
+
+
+def test_train_model_applies_sample_weight_without_crashing():
+    # Regression test: use_class_weight used to compute a class_weight
+    # dict that was printed but never actually passed to fit(). This just
+    # exercises the fast path end-to-end (grid_search=False,
+    # calibrate=False) and checks the result is a usable fitted model.
+    rng = np.random.RandomState(0)
+    n = 60
+    X_train = pd.DataFrame(rng.rand(n, 4), columns=['a', 'b', 'c', 'd'])
+    y_train = pd.Series(rng.randint(0, 2, size=n))
+
+    model = modeling.train_model(X_train, y_train, grid_search=False,
+                                 use_class_weight=True, calibrate=False)
+
+    preds = model.predict_proba(X_train)
+    assert preds.shape == (n, 2)
+
+
+def test_train_model_unknown_model_type_raises():
+    rng = np.random.RandomState(0)
+    n = 30
+    X_train = pd.DataFrame(rng.rand(n, 3), columns=['a', 'b', 'c'])
+    y_train = pd.Series(rng.randint(0, 2, size=n))
+
+    with pytest.raises(ValueError):
+        modeling.train_model(X_train, y_train, grid_search=False,
+                             calibrate=False, model_type='not_a_real_model')

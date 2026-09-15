@@ -63,6 +63,7 @@ This will:
 python main.py --years 2018 2022              # season range (default: 2018-2022)
 python main.py --no-grid-search                # skip hyperparameter search (much faster)
 python main.py --no-betting                     # skip the betting simulation
+python main.py --model-type xgboost             # use XGBoost instead of sklearn's GBM
 python main.py --save-model ./model.pkl         # save the trained model after training
 python main.py --load-model ./model.pkl         # reuse a saved model instead of retraining
 python main.py --data-dir ./data                # where Retrosheet files live/are cached
@@ -164,18 +165,33 @@ importance = predictor.feature_importance()
   80/20 split
 - Model persistence: `pipeline.save_model()` / `load_model()` are wired into the pipeline and
   exposed via `main.py --save-model` / `--load-model`
+- Optional XGBoost backend alongside the default GradientBoostingClassifier - pass
+  `model_type='xgboost'` (or `main.py --model-type xgboost`); falls back to the sklearn model with
+  a warning if `xgboost` isn't installed
+- Calibration/reliability diagnostics via `modeling.calibration_report()` - per-bin predicted vs.
+  actual win rate, plus Expected Calibration Error (ECE)
 - Multiple evaluation metrics (accuracy, AUC, Brier score, log loss)
 - Feature importance analysis
 - **BUG FIX**: probability calibration and feature-importance extraction now work with current
   scikit-learn (`CalibratedClassifierCV(cv='prefit')` was removed upstream; feature importance
   was reading feature names off the wrong pipeline step)
+- **BUG FIX**: `use_class_weight=True` (the default) computed a class-weight dict, printed it, and
+  then never actually used it anywhere - `GradientBoostingClassifier` doesn't take `class_weight`,
+  and nothing turned it into `sample_weight` for `.fit()`. Sample weights are now computed and
+  passed through training (and the calibration re-fit) for real.
 
 ### Betting Simulation (`betting.py`)
-- Kelly Criterion bet sizing
+- Kelly Criterion bet sizing, now using each bet's actual American odds (converted to decimal) for
+  both stake sizing and payout, on whichever side (home or away) has the larger edge
 - Minimum edge thresholds
 - Bankroll management
 - Performance by confidence level
-- **NOTE**: Currently assumes fair odds without vig
+- A parallel flat-betting simulation (fixed stake per bet) run on the same bets, for comparison
+  against Kelly sizing
+- **BUG FIX**: bet sizing and payouts used to always assume fair, no-vig 2.0 decimal odds
+  regardless of the actual moneyline, and only ever considered betting the home side. Real
+  `home_moneyline`/`away_moneyline` are now threaded through from the pipeline (`odds_df` param);
+  omitting them still works, falling back to the old fair-odds assumption.
 
 ### Prediction (`predict.py`)
 - Single game outcome prediction
@@ -204,20 +220,21 @@ The code includes extensive TODO comments marking oversimplifications. Key areas
 
 ### Medium Priority
 4. **Better hyperparameter tuning**
-   - Consider Bayesian optimization (Optuna)
-   - Try XGBoost or LightGBM
+   - ~~Try XGBoost~~ - done, `model_type='xgboost'` (optional dependency)
+   - Still needed: LightGBM, Bayesian optimization (Optuna)
 
 5. **Improve bet sizing**
-   - Current: Simplified Kelly with fair odds
-   - Needed: Kelly with actual vig-adjusted odds
+   - ~~Kelly with actual (vig-included) American odds~~ - done, see `betting.evaluate_betting_performance(odds_df=...)`
+   - Still needed: the odds themselves are still synthetic (see #1) - the *math* is now
+     odds-realistic, but there's no real vig/market efficiency to bet against yet, so ROI numbers
+     from the current placeholder data are not meaningful
 
 6. **Add recency weighting**
-   - Current: Simple moving averages
-   - Needed: Exponentially weighted stats (recent games matter more)
+   - ~~Simple moving averages~~ - done, EWMA is the default (see `features.engineer_features(use_ewma=True)`)
 
 ### Lower Priority (But Still Important)
 7. ~~Walk-forward validation~~ - done, see `modeling.walk_forward_validation()`
-8. Calibration curves
+8. ~~Calibration curves~~ - done, see `modeling.calibration_report()` (ECE + per-bin reliability table)
 9. SHAP values for feature importance
 10. Injury/roster data
 11. Weather features

@@ -172,10 +172,10 @@ class MLBPredictor:
         return modeling.prepare_model_data(feature_df, test_size)
     
     def train_model(self, X_train: pd.DataFrame, y_train: pd.Series,
-                   grid_search: bool = True) -> Pipeline:
+                   grid_search: bool = True, model_type: str = 'gbm') -> Pipeline:
         """
         Train the prediction model.
-        
+
         Parameters
         ----------
         X_train : pd.DataFrame
@@ -184,13 +184,15 @@ class MLBPredictor:
             Training labels
         grid_search : bool, optional
             Whether to use grid search for hyperparameters
-        
+        model_type : str, optional
+            'gbm' (default) or 'xgboost' - see modeling.train_model
+
         Returns
         -------
         Pipeline
             Trained model
         """
-        self.model = modeling.train_model(X_train, y_train, grid_search)
+        self.model = modeling.train_model(X_train, y_train, grid_search=grid_search, model_type=model_type)
         return self.model
     
     def evaluate_model(self, X_test: pd.DataFrame, y_test: pd.Series) -> Dict:
@@ -247,28 +249,55 @@ class MLBPredictor:
             feature_df, n_splits=n_splits, grid_search=grid_search
         )
 
-    def evaluate_betting_performance(self, X_test: pd.DataFrame,
-                                    y_test: pd.Series,
-                                    kelly_fraction: float = 0.25) -> Dict:
+    def calibration_report(self, X_test: pd.DataFrame,
+                          y_test: pd.Series,
+                          n_bins: int = 10) -> Dict:
         """
-        Evaluate betting strategy performance.
-        
+        Assess how well-calibrated the model's predicted probabilities are.
+
         Parameters
         ----------
         X_test : pd.DataFrame
             Test features
         y_test : pd.Series
             Test labels
+        n_bins : int, optional
+            Number of probability bins for the reliability diagram
+
+        Returns
+        -------
+        dict
+            Per-bin reliability stats plus Expected Calibration Error (ECE)
+        """
+        return modeling.calibration_report(self.model, X_test, y_test, n_bins=n_bins)
+
+    def evaluate_betting_performance(self, X_test: pd.DataFrame,
+                                    y_test: pd.Series,
+                                    odds_df: Optional[pd.DataFrame] = None,
+                                    kelly_fraction: float = 0.25) -> Dict:
+        """
+        Evaluate betting strategy performance.
+
+        Parameters
+        ----------
+        X_test : pd.DataFrame
+            Test features
+        y_test : pd.Series
+            Test labels
+        odds_df : pd.DataFrame, optional
+            DataFrame with 'home_moneyline'/'away_moneyline' columns,
+            indexed the same as X_test/y_test, for realistic bet sizing
+            and payouts. Falls back to assumed fair odds if omitted.
         kelly_fraction : float, optional
             Kelly criterion fraction for bet sizing
-        
+
         Returns
         -------
         dict
             Betting performance metrics
         """
         return betting.evaluate_betting_performance(
-            self.model, X_test, y_test, kelly_fraction
+            self.model, X_test, y_test, odds_df=odds_df, kelly_fraction=kelly_fraction
         )
     
     def predict_game(self, home_team: str, visiting_team: str,
@@ -301,10 +330,11 @@ class MLBPredictor:
     def run_complete_pipeline(self, years: Optional[List[int]] = None,
                              test_size: float = 0.2,
                              grid_search: bool = True,
-                             evaluate_betting: bool = True) -> Dict:
+                             evaluate_betting: bool = True,
+                             model_type: str = 'gbm') -> Dict:
         """
         Run the complete pipeline from data download to evaluation.
-        
+
         Parameters
         ----------
         years : list of int, optional
@@ -315,7 +345,9 @@ class MLBPredictor:
             Whether to use grid search
         evaluate_betting : bool, optional
             Whether to evaluate betting performance
-        
+        model_type : str, optional
+            'gbm' (default) or 'xgboost' - see modeling.train_model
+
         Returns
         -------
         dict
@@ -326,7 +358,8 @@ class MLBPredictor:
             data_dir=self.data_dir,
             test_size=test_size,
             grid_search=grid_search,
-            evaluate_betting=evaluate_betting
+            evaluate_betting=evaluate_betting,
+            model_type=model_type
         )
         
         # Store model and data for later use

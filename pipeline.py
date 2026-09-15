@@ -25,7 +25,8 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
                           test_size: float = 0.2,
                           grid_search: bool = True,
                           evaluate_betting: bool = True,
-                          model_path: Optional[str] = None) -> Dict:
+                          model_path: Optional[str] = None,
+                          model_type: str = 'gbm') -> Dict:
     """
     Run the complete model pipeline from data download to evaluation.
     
@@ -56,6 +57,8 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     model_path : str, optional
         If given, save the trained model pipeline to this path (via
         joblib) after training completes.
+    model_type : str, optional
+        'gbm' (default) or 'xgboost' - see modeling.train_model
 
     Returns
     -------
@@ -65,6 +68,7 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         - 'game_data': Historical game data
         - 'metrics': Model evaluation metrics
         - 'feature_importance': Feature importance DataFrame
+        - 'calibration': Calibration/reliability report (see modeling.calibration_report)
         - 'betting_results': Betting performance metrics (if evaluate_betting=True)
         
     Examples
@@ -144,7 +148,7 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     # Step 7: Train model
     print("STEP 7/10: Training model...")
     print("-" * 70)
-    model = modeling.train_model(X_train, y_train, grid_search=grid_search)
+    model = modeling.train_model(X_train, y_train, grid_search=grid_search, model_type=model_type)
     print()
     
     # Step 8: Evaluate model
@@ -158,14 +162,20 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
     print("-" * 70)
     importance_df = modeling.feature_importance(model)
     print()
+
+    calibration = modeling.calibration_report(model, X_test, y_test)
+    print()
     
     # Step 10: Betting performance (optional)
     betting_results = None
     if evaluate_betting:
         print("STEP 10/10: Evaluating betting performance...")
         print("-" * 70)
+        odds_cols = ['home_moneyline', 'away_moneyline']
+        test_odds = (feature_df.loc[X_test.index, odds_cols]
+                     if all(c in feature_df.columns for c in odds_cols) else None)
         betting_results = betting.evaluate_betting_performance(
-            model, X_test, y_test
+            model, X_test, y_test, odds_df=test_odds
         )
         print()
     else:
@@ -188,6 +198,7 @@ def run_complete_pipeline(years: Optional[List[int]] = None,
         'game_data': game_data,
         'metrics': metrics,
         'feature_importance': importance_df,
+        'calibration': calibration,
         'betting_results': betting_results,
         'test_data': (X_test, y_test)
     }

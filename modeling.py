@@ -3,9 +3,8 @@ Modeling module for MLB prediction.
 
 This module handles model training, evaluation, and feature importance analysis.
 
-TODO: Experiment with alternative models (XGBoost, LightGBM, neural networks)
+TODO: Experiment with alternative models (LightGBM, neural networks)
 TODO: Implement proper hyperparameter optimization (Bayesian optimization)
-TODO: Add calibration curves and reliability diagrams
 TODO: Implement ensemble methods
 """
 
@@ -15,8 +14,8 @@ from sklearn.model_selection import train_test_split, GridSearchCV, TimeSeriesSp
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                             f1_score, roc_auc_score, brier_score_loss,
                             log_loss)
 from typing import Tuple, Dict, Optional
@@ -166,15 +165,83 @@ def _select_features(feature_df: pd.DataFrame, min_year: int) -> Tuple[pd.DataFr
     return X, y
 
 
-def train_model(X_train: pd.DataFrame, 
+def _build_classifier(model_type: str, random_state: int, tuned: bool):
+    """
+    Construct the (untrained) classifier step for the given model_type.
+
+    Parameters
+    ----------
+    model_type : str
+        'gbm' (sklearn GradientBoostingClassifier) or 'xgboost'
+    random_state : int
+        Random seed
+    tuned : bool
+        If False, use fixed "reasonable default" hyperparameters directly
+        on the classifier (the grid_search=False fast path). If True, use
+        bare defaults - hyperparameters are set via GridSearchCV instead.
+
+    Returns
+    -------
+    (classifier, param_grid)
+        param_grid is the GridSearchCV grid to use when tuned=True; it's
+        unused (and can be ignored) when tuned=False.
+    """
+    if model_type == 'xgboost':
+        from xgboost import XGBClassifier
+        if tuned:
+            classifier = XGBClassifier(
+                n_estimators=200,
+                learning_rate=0.05,
+                max_depth=4,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                eval_metric='logloss',
+                random_state=random_state,
+            )
+        else:
+            classifier = XGBClassifier(eval_metric='logloss', random_state=random_state)
+        param_grid = {
+            'classifier__n_estimators': [100, 200, 300],
+            'classifier__learning_rate': [0.01, 0.05, 0.1],
+            'classifier__max_depth': [3, 4, 5],
+            'classifier__subsample': [0.8, 1.0],
+            'classifier__colsample_bytree': [0.8, 1.0],
+        }
+    elif model_type == 'gbm':
+        if tuned:
+            classifier = GradientBoostingClassifier(
+                n_estimators=200,
+                learning_rate=0.05,
+                max_depth=4,
+                min_samples_split=5,
+                subsample=0.8,
+                random_state=random_state,
+            )
+        else:
+            classifier = GradientBoostingClassifier(random_state=random_state)
+        param_grid = {
+            'classifier__n_estimators': [100, 200, 300],
+            'classifier__learning_rate': [0.01, 0.05, 0.1],
+            'classifier__max_depth': [3, 4, 5],
+            'classifier__min_samples_split': [2, 5],
+            'classifier__subsample': [0.8, 1.0],
+        }
+    else:
+        raise ValueError(f"Unknown model_type '{model_type}'. Use 'gbm' or 'xgboost'.")
+
+    return classifier, param_grid
+
+
+def train_model(X_train: pd.DataFrame,
                 y_train: pd.Series,
                 grid_search: bool = True,
                 random_state: int = 42,
                 use_class_weight: bool = True,
-                calibrate: bool = True) -> Pipeline:
+                calibrate: bool = True,
+                model_type: str = 'gbm') -> Pipeline:
     """
     Train a machine learning model for game prediction.
-    
+
     Parameters
     ----------
     X_train : pd.DataFrame
@@ -186,88 +253,81 @@ def train_model(X_train: pd.DataFrame,
     random_state : int, optional
         Random seed for reproducibility
     use_class_weight : bool, optional
-        Whether to use balanced class weights (recommended for ~54% home win rate)
+        Whether to weight training samples inversely to class frequency
+        (recommended for the ~54% home win rate)
     calibrate : bool, optional
         Whether to calibrate probabilities using isotonic regression (default: True)
         IMPORTANT: Calibration improves probability estimates for betting
-    
+    model_type : str, optional
+        'gbm' (default) for sklearn's GradientBoostingClassifier, or
+        'xgboost' for XGBClassifier (requires the optional `xgboost`
+        package - falls back to 'gbm' with a warning if it isn't
+        installed)
+
     Returns
     -------
     sklearn.pipeline.Pipeline
         Trained model pipeline
-        
+
     Notes
     -----
-    Uses GradientBoostingClassifier by default as it typically
-    performs well on structured data with mixed feature types.
-    
-    CURRENT MODEL CHOICE:
-    - GradientBoostingClassifier: Good baseline, interpretable
+    CURRENT MODEL CHOICES:
+    - GradientBoostingClassifier (default) or XGBClassifier: both handle
+      structured/tabular data with mixed feature types well
     - StandardScaler: Normalizes features (important for some models)
-    
+
     IMPROVEMENTS IMPLEMENTED:
     ✅ Added random_state for reproducibility
     ✅ Included StandardScaler in pipeline
-    ✅ Grid search over key hyperparameters
-    ✅ Class weights to handle home field advantage imbalance
-    
+    ✅ Grid search over key hyperparameters (with TimeSeriesSplit CV)
+    ✅ Per-sample weights to handle home field advantage imbalance
+    ✅ Optional XGBoost backend
+    ✅ Probability calibration (CalibratedClassifierCV)
+
     TODO: Model variants to try:
-    1. XGBoost or LightGBM (often outperform sklearn GBM)
-       - Better handling of missing values
-       - Built-in regularization
-       - Faster training
-       
+    1. LightGBM
     2. Neural networks (MLPClassifier or deep learning)
-       - Can capture complex nonlinear interactions
-       - May need more data to avoid overfitting
-       
     3. Ensemble methods:
-       - Stack multiple models (GBM + RF + Logistic)
+       - Stack multiple models (GBM + XGBoost + Logistic)
        - Voting classifier
        - Weighted averaging based on recent performance
-       
-    4. Calibration:
-       - CalibratedClassifierCV to improve probability estimates
-       - Important for betting applications
-       
+
     TODO: Hyperparameter optimization approaches:
     - Bayesian optimization (scikit-optimize, Optuna)
     - Randomized search for faster initial exploration
     - Nested cross-validation for unbiased performance estimates
     """
     print("Training model...")
-    
-    # Calculate class weights if enabled
-    # Baseball has ~54% home win rate, so slight imbalance
+
+    if model_type == 'xgboost':
+        try:
+            import xgboost  # noqa: F401
+        except ImportError:
+            print("xgboost is not installed (pip install xgboost) - falling back to model_type='gbm'.")
+            model_type = 'gbm'
+
+    # Per-sample weights for class imbalance. Baseball has a ~54% home win
+    # rate, so a slight imbalance exists.
+    # BUG FIX: this used to compute a class_weight *dict* and only print
+    # it - GradientBoostingClassifier doesn't accept class_weight, and the
+    # dict was never turned into sample_weight or passed to fit(), so
+    # use_class_weight=True (the default) silently did nothing.
     if use_class_weight:
-        from sklearn.utils.class_weight import compute_class_weight
+        from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
         classes = np.unique(y_train)
         class_weights = compute_class_weight('balanced', classes=classes, y=y_train)
         class_weight_dict = {classes[i]: class_weights[i] for i in range(len(classes))}
         print(f"Using class weights: {class_weight_dict}")
+        sample_weight = compute_sample_weight('balanced', y_train)
     else:
-        class_weight_dict = None
-    
+        sample_weight = None
+
     if grid_search:
-        # Define pipeline with scaling and classification
+        classifier, param_grid = _build_classifier(model_type, random_state, tuned=False)
         pipeline = Pipeline([
             ('scaler', StandardScaler()),
-            ('classifier', GradientBoostingClassifier(random_state=random_state))
+            ('classifier', classifier)
         ])
-        
-        # Hyperparameter grid
-        # IMPROVEMENT: Expanded from original with better ranges
-        param_grid = {
-            'classifier__n_estimators': [100, 200, 300],  # More trees generally better
-            'classifier__learning_rate': [0.01, 0.05, 0.1],  # Smaller = more conservative
-            'classifier__max_depth': [3, 4, 5],  # Depth controls complexity
-            'classifier__min_samples_split': [2, 5],  # Regularization parameter
-            'classifier__subsample': [0.8, 1.0],  # Stochastic gradient boosting
-        }
-        
-        # Note: GradientBoostingClassifier doesn't support class_weight directly
-        # For class imbalance, we could use sample_weight in fit() or try different models
-        # Keeping this simple for now, but documenting the limitation
 
         # TODO: Use RandomizedSearchCV for faster search with more parameters
         # TODO: Implement Bayesian optimization for more efficient search
@@ -286,48 +346,53 @@ def train_model(X_train: pd.DataFrame,
             n_jobs=-1,
             verbose=1
         )
-        
-        grid.fit(X_train, y_train)
+
+        fit_kwargs = {'classifier__sample_weight': sample_weight} if sample_weight is not None else {}
+        grid.fit(X_train, y_train, **fit_kwargs)
         model = grid.best_estimator_
-        
+
         print(f"Best parameters: {grid.best_params_}")
         print(f"Best CV score: {-grid.best_score_:.4f} (log loss)")
-        
+
     else:
         # Use fixed hyperparameters (faster, good for initial testing)
-        # IMPROVEMENT: Better default parameters than before
+        classifier, _ = _build_classifier(model_type, random_state, tuned=True)
         pipeline = Pipeline([
             ('scaler', StandardScaler()),
-            ('classifier', GradientBoostingClassifier(
-                n_estimators=200,
-                learning_rate=0.05,  # Slightly lower for stability
-                max_depth=4,  # Moderate depth
-                min_samples_split=5,  # Prevent overfitting
-                subsample=0.8,  # Stochastic boosting
-                random_state=random_state
-            ))
+            ('classifier', classifier)
         ])
-        
-        model = pipeline.fit(X_train, y_train)
-    
+
+        fit_kwargs = {'classifier__sample_weight': sample_weight} if sample_weight is not None else {}
+        model = pipeline.fit(X_train, y_train, **fit_kwargs)
+
     # IMPROVEMENT: Add probability calibration
     # This is CRITICAL for betting applications where probability accuracy matters
     if calibrate:
         print("Calibrating probabilities with isotonic regression...")
         # Use 'isotonic' for non-parametric calibration (works well for tree ensembles)
-        # Split training data for calibration to avoid overfitting
+        # Split training data (and its sample weights, kept aligned) for
+        # calibration to avoid overfitting.
         from sklearn.model_selection import train_test_split as split
-        X_train_sub, X_cal, y_train_sub, y_cal = split(
-            X_train, y_train, test_size=0.2, random_state=random_state, stratify=y_train
-        )
-        
+        if sample_weight is not None:
+            X_train_sub, X_cal, y_train_sub, y_cal, w_train_sub, w_cal = split(
+                X_train, y_train, sample_weight, test_size=0.2,
+                random_state=random_state, stratify=y_train
+            )
+        else:
+            X_train_sub, X_cal, y_train_sub, y_cal = split(
+                X_train, y_train, test_size=0.2, random_state=random_state, stratify=y_train
+            )
+            w_train_sub = None
+
+        sub_fit_kwargs = {'classifier__sample_weight': w_train_sub} if w_train_sub is not None else {}
+
         # Refit base model on subset
         if grid_search:
-            grid.fit(X_train_sub, y_train_sub)
+            grid.fit(X_train_sub, y_train_sub, **sub_fit_kwargs)
             base_model = grid.best_estimator_
         else:
-            base_model = pipeline.fit(X_train_sub, y_train_sub)
-        
+            base_model = pipeline.fit(X_train_sub, y_train_sub, **sub_fit_kwargs)
+
         # Now calibrate on held-out calibration set
         # scikit-learn >=1.6 removed cv='prefit' in favor of wrapping the
         # already-fitted estimator in FrozenEstimator; fall back to the old
@@ -344,6 +409,9 @@ def train_model(X_train: pd.DataFrame,
                 method='isotonic',
                 cv='prefit'  # Model already trained
             )
+        # Deliberately unweighted: calibration should map predicted
+        # probabilities to the *true* observed outcome frequency, not a
+        # class-rebalanced one.
         calibrated_model.fit(X_cal, y_cal)
         model = calibrated_model
         print("✅ Calibration complete - probabilities should be more accurate")
@@ -517,6 +585,87 @@ def walk_forward_validation(feature_df: pd.DataFrame,
     print("=" * 70)
 
     return {'folds': fold_metrics, 'mean': mean_metrics, 'std': std_metrics}
+
+
+def calibration_report(model: Pipeline,
+                       X_test: pd.DataFrame,
+                       y_test: pd.Series,
+                       n_bins: int = 10) -> Dict:
+    """
+    Assess how well-calibrated the model's predicted probabilities are.
+
+    A model can have good accuracy/AUC while still being poorly
+    calibrated (e.g. systematically overconfident) - which matters a lot
+    for betting, since bet sizing (Kelly criterion) depends on the
+    predicted probability being an honest estimate, not just on which
+    side of 50% it falls on.
+
+    Parameters
+    ----------
+    model : sklearn.pipeline.Pipeline
+        Trained (optionally calibrated) prediction model
+    X_test : pd.DataFrame
+        Test features
+    y_test : pd.Series
+        Test outcomes
+    n_bins : int, optional
+        Number of probability bins for the reliability diagram (default: 10)
+
+    Returns
+    -------
+    dict
+        'bins': DataFrame with one row per bin (predicted avg probability,
+            actual win rate, bin count)
+        'ece': Expected Calibration Error - the bin-count-weighted average
+            gap between predicted probability and actual outcome frequency
+            (0 = perfectly calibrated, higher = worse)
+        'max_calibration_error': the single worst bin's gap
+
+    Notes
+    -----
+    TODO: Plot an actual reliability diagram (this reports the same
+    underlying data as text/a DataFrame, since the project has no
+    plotting dependency yet)
+    """
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+    prob_true, prob_pred = calibration_curve(y_test, y_pred_proba, n_bins=n_bins, strategy='uniform')
+
+    # calibration_curve silently drops empty bins, so recompute counts per
+    # bin ourselves to weight the ECE correctly and report them. Must use
+    # the exact same bin assignment sklearn uses internally (searchsorted
+    # against the interior edges), not np.digitize - the two disagree on
+    # values landing exactly on a bin edge, which then desyncs the
+    # nonzero-bin counts from calibration_curve's (prob_true, prob_pred).
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_idx = np.searchsorted(bin_edges[1:-1], y_pred_proba)
+    counts = np.bincount(bin_idx, minlength=n_bins)[:n_bins]
+    non_empty = counts > 0
+    bin_counts = counts[non_empty]
+
+    gaps = np.abs(prob_true - prob_pred)
+    ece = float(np.sum(bin_counts * gaps) / bin_counts.sum())
+    max_calibration_error = float(gaps.max()) if len(gaps) else 0.0
+
+    bins_df = pd.DataFrame({
+        'predicted_prob': prob_pred,
+        'actual_win_rate': prob_true,
+        'gap': gaps,
+        'count': bin_counts,
+    })
+
+    print("\nCalibration / Reliability Report:")
+    print("=" * 60)
+    print(f"{'Predicted':>12} {'Actual':>12} {'Gap':>10} {'Count':>8}")
+    for _, row in bins_df.iterrows():
+        print(f"{row['predicted_prob']:>12.3f} {row['actual_win_rate']:>12.3f} "
+              f"{row['gap']:>10.3f} {int(row['count']):>8}")
+    print("-" * 60)
+    print(f"Expected Calibration Error (ECE): {ece:.4f}")
+    print(f"Max Calibration Error:            {max_calibration_error:.4f}")
+    print("=" * 60)
+
+    return {'bins': bins_df, 'ece': ece, 'max_calibration_error': max_calibration_error}
 
 
 def feature_importance(model: Pipeline) -> pd.DataFrame:

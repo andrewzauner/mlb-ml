@@ -33,6 +33,11 @@ def parse_args():
         help="Skip hyperparameter grid search and use fixed defaults (much faster)"
     )
     parser.add_argument(
+        '--model-type', type=str, default='gbm', choices=['gbm', 'xgboost'],
+        help="Classifier backend: 'gbm' (sklearn, default) or 'xgboost' "
+             "(requires the optional xgboost package)"
+    )
+    parser.add_argument(
         '--no-betting', action='store_true',
         help="Skip the betting simulation step"
     )
@@ -77,7 +82,8 @@ def main():
             years=years,
             test_size=0.2,
             grid_search=not args.no_grid_search,
-            evaluate_betting=not args.no_betting
+            evaluate_betting=not args.no_betting,
+            model_type=args.model_type
         )
         if args.save_model:
             pipeline.save_model(mlb_predictor.model, args.save_model)
