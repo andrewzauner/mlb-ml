@@ -147,6 +147,10 @@ def _select_features(feature_df: pd.DataFrame, min_year: int) -> Tuple[pd.DataFr
         'home_starting_pitcher_rolling_5_er',
         'visiting_starting_pitcher_rolling_5_er',
         'starting_pitcher_er_advantage_5',
+        # Park factor: rolling average total runs at this game's park
+        # (only present if the game log data included park IDs)
+        'park_rolling_20_total_runs',
+        'park_rolling_10_total_runs',
     ]
     
     for feat in optional_features:

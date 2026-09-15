@@ -81,6 +81,8 @@ def test_retrosheet_columns_batting_stats_match_known_row(tmp_path):
     # across a full season: never exceeds the opposing team's score.
     assert row['visiting_team_earned_runs'] == 8
     assert row['home_team_earned_runs'] == 2
+    # Park ID - Arizona's home park in 2018 (Chase Field).
+    assert row['park_id'] == 'PHO01'
 
 
 def test_retrosheet_columns_starting_pitchers_match_known_row(tmp_path):

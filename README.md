@@ -151,6 +151,7 @@ importance = predictor.feature_importance()
   exceed the opposing team's score across a full season) and by cross-referencing real player/
   manager identities in a sample row (visiting starter matched Colorado's actual starting pitcher
   that day, consistent with the winning/losing pitcher fields and both teams' batting lineups).
+- **NEW**: Loads the Retrosheet park ID (`park_id`) for each game's venue.
 
 ### Feature Engineering (`features.py`)
 - Rolling team statistics (5, 10, 20 game windows)
@@ -159,6 +160,8 @@ importance = predictor.feature_importance()
 - Batting statistics and run differentials
 - **NEW**: Rolling starting-pitcher earned-runs-allowed, a proxy for pitcher quality/ERA (see
   "Add pitcher statistics" below for the caveat on what this is and isn't)
+- **NEW**: Rolling total-runs-per-park, a park factor proxy derived entirely from historical
+  scoring (see "Implement park factors" below)
 - **DEFENSIVE**: Checks for missing columns before use
 - **PERFORMANCE**: Rolling stats are computed with a vectorized `merge_asof`-based lookup instead
   of a per-game `iterrows()` scan of each team's full history - same "no data from the current or
@@ -240,8 +243,14 @@ The code includes extensive TODO comments marking oversimplifications. Key areas
      boxscore/play-by-play data (e.g. Retrosheet event files or a stats API), not just game logs
 
 3. **Implement park factors**
-   - Current: All ballparks treated equally
-   - Needed: Park-adjusted offensive/pitching metrics
+   - Current: a rolling total-runs-per-park feature (`park_rolling_{10,20}_total_runs`, see
+     `features._build_park_long_stats`), derived from the Retrosheet park ID already present in
+     the game logs. Validated against real baseball knowledge: in the 2018 season this correctly
+     ranks Coors Field (Denver, famous for altitude-boosted offense) and Arlington near the very
+     top and Seattle/Miami (well-known pitcher-friendly parks) near the bottom
+   - Still needed: separate offense/pitching split (currently a single combined runs-environment
+     number, not split by which side benefits), and park-adjusted *rate* stats (e.g. park-adjusted
+     wOBA) rather than just a scoring-environment signal
 
 ### Medium Priority
 4. **Better hyperparameter tuning**

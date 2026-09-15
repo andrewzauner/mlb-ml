@@ -156,3 +156,58 @@ def test_calculate_game_features_responds_to_starting_pitcher_id():
     # which should show up rather than the neutral default (4.0).
     assert with_ace['home_starting_pitcher_rolling_5_er'] == pytest.approx(1.5)
     assert without_pitcher['home_starting_pitcher_rolling_5_er'] == pytest.approx(4.0)
+
+
+def test_build_park_long_stats_returns_none_without_park_id_column():
+    merged = _make_merged_games_with_pitchers([
+        {'date': '20180401', 'home_team': 'A', 'visiting_team': 'B',
+         'home_score': 2, 'visiting_score': 1, 'day_night': 'N', 'season': 2018},
+    ])
+    result = features._build_park_long_stats(merged, [10], use_ewma=False, ewma_span=10)
+    assert result is None
+
+
+def test_park_rolling_stats_no_leakage_simple_average():
+    # Park "COORS" hosts 3 games with total runs 10, 14, 18. The 3rd
+    # game's "prior" rolling average should be the mean of games 1-2 only
+    # (12.0), never including the game itself.
+    rows = [
+        {'date': '20180401', 'home_team': 'A', 'visiting_team': 'B',
+         'home_score': 6, 'visiting_score': 4, 'day_night': 'N', 'season': 2018,
+         'park_id': 'COORS'},
+        {'date': '20180402', 'home_team': 'A', 'visiting_team': 'C',
+         'home_score': 9, 'visiting_score': 5, 'day_night': 'N', 'season': 2018,
+         'park_id': 'COORS'},
+        {'date': '20180403', 'home_team': 'A', 'visiting_team': 'D',
+         'home_score': 10, 'visiting_score': 8, 'day_night': 'N', 'season': 2018,
+         'park_id': 'COORS'},
+    ]
+    merged = _make_merged_games_with_pitchers(rows)
+
+    park_stats = features._build_park_long_stats(merged, [10], use_ewma=False, ewma_span=10)
+    assert park_stats is not None
+
+    result = features._merge_park_rolling_stats(merged, park_stats, [10])
+    game3 = result[result['date_str'] == '20180403'].iloc[0]
+    assert game3['park_rolling_10_total_runs'] == pytest.approx((10 + 14) / 2)
+
+
+def test_calculate_game_features_responds_to_park_id():
+    game_data = pd.DataFrame([
+        {'date': '20180401', 'home_team': 'COL', 'visiting_team': 'ARI',
+         'home_score': 12, 'visiting_score': 9, 'park_id': 'COORS'},
+        {'date': '20180406', 'home_team': 'COL', 'visiting_team': 'SFN',
+         'home_score': 8, 'visiting_score': 7, 'park_id': 'COORS'},
+    ])
+
+    with_park = features.calculate_game_features(
+        'COL', 'ARI', '20180501', game_data, park_id='COORS'
+    )
+    without_park = features.calculate_game_features(
+        'COL', 'ARI', '20180501', game_data
+    )
+
+    # Coors' tracked games totaled 21 and 15 runs (mean 18), which should
+    # show up rather than the neutral default (9.0).
+    assert with_park['park_rolling_10_total_runs'] == pytest.approx(18.0)
+    assert without_park['park_rolling_10_total_runs'] == pytest.approx(9.0)

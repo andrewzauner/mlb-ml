@@ -31,6 +31,11 @@ RETROSHEET_COLUMNS = {
     9: 'visiting_score',
     10: 'home_score',
     12: 'day_night',
+    # Retrosheet park ID (e.g. "PHO01" for Arizona's home park). Verified:
+    # 33 distinct values in a season with ~81 games each, matching 30
+    # teams' regular home-game counts (a few play a handful of "home"
+    # games elsewhere, accounting for the extra few venues).
+    16: 'park_id',
     # Box score stats for visiting team
     21: 'visiting_AB',  # At-bats
     22: 'visiting_H',   # Hits
@@ -173,10 +178,11 @@ def load_retrosheet_data(years: List[int], data_dir: str = './data') -> Optional
                         print(f"Warning: {col} not found for {year}, setting to 0")
                         year_data[col] = 0
 
-                # Starting pitcher IDs are strings (Retrosheet player codes,
-                # e.g. "grayj003"), not numeric - just ensure the columns
-                # exist so downstream code can check for them uniformly.
-                for col in ['home_starting_pitcher_id', 'visiting_starting_pitcher_id']:
+                # Starting pitcher IDs and park ID are strings (Retrosheet
+                # player/venue codes, e.g. "grayj003", "PHO01"), not
+                # numeric - just ensure the columns exist so downstream
+                # code can check for them uniformly.
+                for col in ['home_starting_pitcher_id', 'visiting_starting_pitcher_id', 'park_id']:
                     if col not in year_data.columns:
                         print(f"Warning: {col} not found for {year}, setting to empty")
                         year_data[col] = ''

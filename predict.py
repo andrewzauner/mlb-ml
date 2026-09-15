@@ -23,7 +23,8 @@ def predict_game(model: Pipeline,
                 game_date: Optional[str] = None,
                 odds: Optional[Dict] = None,
                 home_starting_pitcher_id: Optional[str] = None,
-                visiting_starting_pitcher_id: Optional[str] = None) -> Dict:
+                visiting_starting_pitcher_id: Optional[str] = None,
+                park_id: Optional[str] = None) -> Dict:
     """
     Predict the outcome of a specific game.
 
@@ -47,7 +48,11 @@ def predict_game(model: Pipeline,
         compute a rolling earned-runs-allowed proxy for pitcher quality;
         omitting them falls back to a neutral league-average value for
         that feature rather than failing.
-    
+    park_id : str, optional
+        Retrosheet park ID (e.g. "PHO01") for the game's venue. Used to
+        compute a rolling park-factor proxy; omitting it falls back to a
+        neutral league-average value.
+
     Returns
     -------
     dict
@@ -98,7 +103,8 @@ def predict_game(model: Pipeline,
         game_data=game_data,
         odds=odds,
         home_starting_pitcher_id=home_starting_pitcher_id,
-        visiting_starting_pitcher_id=visiting_starting_pitcher_id
+        visiting_starting_pitcher_id=visiting_starting_pitcher_id,
+        park_id=park_id
     )
     
     # Convert to DataFrame

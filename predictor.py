@@ -323,7 +323,8 @@ class MLBPredictor:
                     game_date: Optional[str] = None,
                     odds: Optional[Dict] = None,
                     home_starting_pitcher_id: Optional[str] = None,
-                    visiting_starting_pitcher_id: Optional[str] = None) -> Dict:
+                    visiting_starting_pitcher_id: Optional[str] = None,
+                    park_id: Optional[str] = None) -> Dict:
         """
         Predict outcome of a specific game.
 
@@ -341,6 +342,10 @@ class MLBPredictor:
             Retrosheet pitcher IDs (e.g. "grayj003") for each starter, used
             for the rolling earned-runs-allowed pitcher feature. Falls back
             to a neutral default if omitted.
+        park_id : str, optional
+            Retrosheet park ID (e.g. "PHO01") for the game's venue, used
+            for the rolling park-factor feature. Falls back to a neutral
+            default if omitted.
 
         Returns
         -------
@@ -351,7 +356,8 @@ class MLBPredictor:
             self.model, self.game_data, home_team, visiting_team,
             game_date, odds,
             home_starting_pitcher_id=home_starting_pitcher_id,
-            visiting_starting_pitcher_id=visiting_starting_pitcher_id
+            visiting_starting_pitcher_id=visiting_starting_pitcher_id,
+            park_id=park_id
         )
     
     def run_complete_pipeline(self, years: Optional[List[int]] = None,

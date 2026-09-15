@@ -265,6 +265,14 @@ def engineer_features(data: pd.DataFrame,
     pitcher_stats = _build_pitcher_long_stats(df, window_sizes, use_ewma, ewma_span)
     feature_df = _merge_pitcher_rolling_stats(feature_df, pitcher_stats, window_sizes)
 
+    # === Park factor ===
+    # Rolling average total runs scored at this game's park - a proxy for
+    # how hitter/pitcher-friendly the venue is (altitude, dimensions,
+    # etc.), derived entirely from historical scoring rather than needing
+    # separate park-dimension or weather data.
+    park_stats = _build_park_long_stats(df, window_sizes, use_ewma, ewma_span)
+    feature_df = _merge_park_rolling_stats(feature_df, park_stats, window_sizes)
+
     # === Calendar features (one-hot encoded) ===
     # Day of week
     feature_df['day_of_week_num'] = pd.to_datetime(feature_df['date_str']).dt.dayofweek
@@ -318,6 +326,13 @@ def engineer_features(data: pd.DataFrame,
                     if c.startswith('home_starting_pitcher_rolling_')
                     or c.startswith('visiting_starting_pitcher_rolling_')]
     for col in pitcher_cols:
+        feature_df[col] = feature_df[col].fillna(feature_df[col].median())
+
+    # Same treatment for a park's first tracked game - median (roughly
+    # league-average runs), not 0 (which would misleadingly read as an
+    # extreme pitcher's park).
+    park_cols = [c for c in feature_df.columns if c.startswith('park_rolling_')]
+    for col in park_cols:
         feature_df[col] = feature_df[col].fillna(feature_df[col].median())
 
     # Clean up any remaining NaN values
@@ -581,6 +596,79 @@ def _merge_pitcher_rolling_stats(feature_df: pd.DataFrame,
     return working
 
 
+def _build_park_long_stats(df: pd.DataFrame,
+                           window_sizes: List[int],
+                           use_ewma: bool,
+                           ewma_span: int) -> Optional[pd.DataFrame]:
+    """
+    Build a rolling "park factor" proxy: the average total runs scored in
+    games at each park, computed leak-safe (only from games strictly
+    before the one being featurized) via the same merge_asof pattern as
+    the team/pitcher rolling stats.
+
+    Ballparks vary a lot in how much they favor hitting (e.g. Coors
+    Field's altitude) or pitching, which is exactly what a park's
+    historical scoring level captures - no separate weather/altitude/
+    dimensions data needed.
+
+    Returns None if the 'park_id' column isn't present.
+    """
+    if 'park_id' not in df.columns:
+        return None
+
+    long_df = pd.DataFrame({
+        'game_date': df['game_date'].values,
+        'park_id': df['park_id'].values,
+        'total_runs': (df['home_score'] + df['visiting_score']).values,
+    })
+    long_df = long_df[long_df['park_id'].astype(str).str.len() > 0]
+    long_df = long_df.sort_values(['park_id', 'game_date'], kind='mergesort').reset_index(drop=True)
+
+    grp = long_df.groupby('park_id', sort=False)
+    for window in window_sizes:
+        if use_ewma:
+            span = min(window, ewma_span)
+            long_df[f'park_rolling_{window}_total_runs'] = grp['total_runs'].transform(
+                lambda s: s.ewm(span=span, min_periods=1).mean())
+        else:
+            long_df[f'park_rolling_{window}_total_runs'] = grp['total_runs'].transform(
+                lambda s: s.rolling(window=window, min_periods=1).mean())
+
+    return long_df
+
+
+def _merge_park_rolling_stats(feature_df: pd.DataFrame,
+                              park_stats: Optional[pd.DataFrame],
+                              window_sizes: List[int]) -> pd.DataFrame:
+    """
+    Attach each game's park's rolling total-runs average (as of just
+    before this game) onto feature_df, keyed by park_id via merge_asof.
+    Like the pitcher stats, games at a park's first tracked appearance
+    are not dropped - filled with the column median later in
+    engineer_features(), alongside the other engineered features.
+    """
+    if park_stats is None or feature_df.empty:
+        return feature_df
+
+    stat_cols = [f'park_rolling_{w}_total_runs' for w in window_sizes]
+
+    working = feature_df.sort_values('game_date', kind='mergesort').reset_index(drop=True)
+    park_sorted = park_stats.sort_values('game_date', kind='mergesort').reset_index(drop=True)
+    lookup = park_sorted[['game_date', 'park_id'] + stat_cols]
+
+    matched = pd.merge_asof(
+        working[['game_date', 'park_id']],
+        lookup,
+        on='game_date', by='park_id',
+        direction='backward', allow_exact_matches=False,
+    )
+
+    for window in window_sizes:
+        working[f'park_rolling_{window}_total_runs'] = matched[f'park_rolling_{window}_total_runs'].values
+
+    return working
+
+
 def calculate_game_features(home_team: str,
                             visiting_team: str,
                             game_date: str,
@@ -588,7 +676,8 @@ def calculate_game_features(home_team: str,
                             odds: Dict = None,
                             window_sizes: List[int] = [5, 10, 20],
                             home_starting_pitcher_id: Optional[str] = None,
-                            visiting_starting_pitcher_id: Optional[str] = None) -> Dict:
+                            visiting_starting_pitcher_id: Optional[str] = None,
+                            park_id: Optional[str] = None) -> Dict:
     """
     Calculate features for a single game prediction.
 
@@ -612,6 +701,10 @@ def calculate_game_features(home_team: str,
         engineer_features(). If omitted, or if game_data doesn't carry the
         needed columns, those features default to a neutral ~league-average
         value rather than being left out.
+    park_id : str, optional
+        Retrosheet park ID (e.g. "PHO01") for the game's venue, used to
+        compute the same rolling park-factor proxy as engineer_features().
+        Falls back to a neutral league-average default if omitted.
 
     Returns
     -------
@@ -765,6 +858,28 @@ def calculate_game_features(home_team: str,
         features[f'starting_pitcher_er_advantage_{window}'] = (
             features[f'visiting_starting_pitcher_rolling_{window}_er'] -
             features[f'home_starting_pitcher_rolling_{window}_er']
+        )
+
+    # Park factor (optional - see calculate_game_features docstring).
+    park_id_available = 'park_id' in game_data.columns
+    park_league_average_total_runs = 9.0  # ~league-average runs/game
+
+    def _park_recent_total_runs(n: int) -> Optional[float]:
+        if not park_id_available or not park_id:
+            return None
+        park_games = game_data.loc[game_data['park_id'] == park_id, ['date', 'home_score', 'visiting_score']]
+        park_games = park_games[park_games['date'].astype(str) < str(game_date)].sort_values('date')
+        if park_games.empty:
+            return None
+        recent = park_games.tail(n)
+        return (recent['home_score'] + recent['visiting_score']).mean()
+
+    for window in (10, 20):
+        if window not in window_sizes:
+            continue
+        park_runs = _park_recent_total_runs(window)
+        features[f'park_rolling_{window}_total_runs'] = (
+            park_runs if park_runs is not None else park_league_average_total_runs
         )
 
     # Temporal features
